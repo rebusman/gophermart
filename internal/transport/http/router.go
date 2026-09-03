@@ -1,6 +1,8 @@
 package httptransport
 
 import (
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 
@@ -9,6 +11,9 @@ import (
 	"gophermart/internal/transport/http/handlers"
 	"gophermart/internal/transport/http/middleware"
 )
+
+// ErrMissingRouterConfig возвращается, когда обязательное поле RouterConfig
+var ErrMissingRouterConfig = errors.New("обязательное поле конфигурации маршрутизатора не задано")
 
 // RouterConfig содержит параметры сборки маршрутизатора.
 type RouterConfig struct {
@@ -34,7 +39,11 @@ type Router struct {
 }
 
 // NewRouter собирает маршрутизатор со сквозными обработчиками.
-func NewRouter(cfg RouterConfig) *Router {
+func NewRouter(cfg RouterConfig) (*Router, error) {
+	if err := validateRouterConfig(cfg); err != nil {
+		return nil, err
+	}
+
 	mux := chi.NewRouter()
 	mux.NotFound(notFoundHandler)
 	mux.MethodNotAllowed(methodNotAllowedHandler)
@@ -58,7 +67,37 @@ func NewRouter(cfg RouterConfig) *Router {
 		Router:    mux,
 		handler:   handler,
 		protected: protected,
+	}, nil
+}
+
+// validateRouterConfig проверяет обязательные зависимости и параметры
+func validateRouterConfig(cfg RouterConfig) error {
+	var errs []error
+
+	if cfg.Logger == nil {
+		errs = append(errs, fmt.Errorf("%w: RouterConfig.Logger", ErrMissingRouterConfig))
 	}
+
+	if cfg.Auth == nil {
+		errs = append(errs, fmt.Errorf("%w: RouterConfig.Auth", ErrMissingRouterConfig))
+	}
+
+	if cfg.Orders == nil {
+		errs = append(errs, fmt.Errorf("%w: RouterConfig.Orders", ErrMissingRouterConfig))
+	}
+
+	if cfg.Authenticator == nil {
+		errs = append(errs, fmt.Errorf("%w: RouterConfig.Authenticator", ErrMissingRouterConfig))
+	}
+
+	if cfg.MaxRequestBodyBytes <= 0 {
+		errs = append(errs, fmt.Errorf(
+			"%w: RouterConfig.MaxRequestBodyBytes, ожидается положительное значение",
+			ErrMissingRouterConfig,
+		))
+	}
+
+	return errors.Join(errs...)
 }
 
 // Protected возвращает маршрутизатор группы защищённых маршрутов.

@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"gophermart/internal/app"
+	httptransport "gophermart/internal/transport/http"
 	"gophermart/tests/testutil"
 )
 
@@ -278,5 +281,49 @@ func TestMainFailsWhenDatabaseUnreachable(t *testing.T) {
 	err := app.Main(t.Context(), []string{"-a", "127.0.0.1:0"}, lookupFrom(env), io.Discard)
 	if err == nil {
 		t.Error("ожидалась ошибка подключения к недоступной базе данных")
+	}
+}
+
+func TestServiceDoesNotStartWithIncompleteRouterConfig(t *testing.T) {
+	dsn := testutil.NewDatabase(t)
+
+	cfg, err := app.LoadConfig(nil, lookupFrom(map[string]string{
+		app.EnvDatabaseURI:          dsn,
+		app.EnvAccrualSystemAddress: "http://localhost:8081",
+		app.EnvJWTSecret:            "секрет",
+	}))
+	if err != nil {
+		t.Fatalf("загрузка конфигурации: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("резервирование HTTP-порта: %v", err)
+	}
+
+	address := listener.Addr().String()
+	if err = listener.Close(); err != nil {
+		t.Fatalf("освобождение HTTP-порта: %v", err)
+	}
+
+	cfg.RunAddress = address
+	cfg.MaxRequestBodyBytes = 0
+
+	err = app.Run(t.Context(), cfg, slog.New(slog.DiscardHandler))
+	if err == nil {
+		t.Fatal("сервис запустился с неполной конфигурацией маршрутизатора")
+	}
+
+	if !errors.Is(err, httptransport.ErrMissingRouterConfig) {
+		t.Errorf("ожидалась ошибка %v, получено: %v", httptransport.ErrMissingRouterConfig, err)
+	}
+
+	probe, err := net.Listen("tcp", address)
+	if err != nil {
+		t.Fatalf("HTTP-порт остался занят после отказа запуска: %v", err)
+	}
+
+	if err = probe.Close(); err != nil {
+		t.Errorf("закрытие проверочного сокета: %v", err)
 	}
 }

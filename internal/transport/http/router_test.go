@@ -3,20 +3,63 @@ package httptransport_test
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"gophermart/internal/domain"
 	httptransport "gophermart/internal/transport/http"
+	"gophermart/internal/transport/http/handlers"
 	"gophermart/internal/transport/http/middleware"
 )
 
 // routerBodyLimit — лимит размера тела, используемый тестами маршрутизатора.
 const routerBodyLimit = 32
+
+type routerAuthService struct{}
+
+func (routerAuthService) Register(context.Context, string, string) (string, error) {
+	return "тестовый-токен", nil
+}
+
+func (routerAuthService) Login(context.Context, string, string) (string, error) {
+	return "тестовый-токен", nil
+}
+
+type routerOrderService struct{}
+
+func (routerOrderService) Upload(context.Context, domain.OrderNumber, domain.UserID) (domain.OrderUpload, error) {
+	return domain.OrderUploadAccepted, nil
+}
+
+func (routerOrderService) List(context.Context, domain.UserID) ([]domain.Order, error) {
+	return []domain.Order{}, nil
+}
+
+type routerAuthenticator struct{}
+
+func (routerAuthenticator) Authenticate(context.Context, string) (domain.UserID, error) {
+	return domain.UserID{}, nil
+}
+
+// newRouterConfig возвращает полностью заполненную конфигурацию с подставными
+// зависимостями для тестов маршрутизатора.
+func newRouterConfig(logs *bytes.Buffer) httptransport.RouterConfig {
+	return httptransport.RouterConfig{
+		Logger:              slog.New(slog.NewJSONHandler(logs, nil)),
+		MaxRequestBodyBytes: routerBodyLimit,
+		Auth:                handlers.NewAuth(routerAuthService{}, time.Hour),
+		Orders:              handlers.NewOrders(routerOrderService{}),
+		Authenticator:       routerAuthenticator{},
+	}
+}
 
 // newRouter собирает маршрутизатор с логгером, пишущим в возвращаемый буфер, и
 // одним зарегистрированным публичным маршрутом, отвечающим кодом 200.
@@ -29,10 +72,10 @@ func newRouter(t *testing.T) (*httptransport.Router, *bytes.Buffer) {
 
 	logs := &bytes.Buffer{}
 
-	router := httptransport.NewRouter(httptransport.RouterConfig{
-		Logger:              slog.New(slog.NewJSONHandler(logs, nil)),
-		MaxRequestBodyBytes: routerBodyLimit,
-	})
+	router, err := httptransport.NewRouter(newRouterConfig(logs))
+	if err != nil {
+		t.Fatalf("сборка маршрутизатора: %v", err)
+	}
 
 	router.Post("/api/user/тестовый-маршрут", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "принято")
@@ -41,9 +84,9 @@ func newRouter(t *testing.T) (*httptransport.Router, *bytes.Buffer) {
 	// Маршрут читает тело целиком и потому обнаруживает превышение лимита
 	// даже тогда, когда длина запроса заранее неизвестна.
 	router.Post("/echo", func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			if middleware.IsBodyTooLarge(err) {
+		body, readErr := io.ReadAll(r.Body)
+		if readErr != nil {
+			if middleware.IsBodyTooLarge(readErr) {
 				w.WriteHeader(http.StatusRequestEntityTooLarge)
 
 				return
@@ -58,6 +101,58 @@ func newRouter(t *testing.T) (*httptransport.Router, *bytes.Buffer) {
 	})
 
 	return router, logs
+}
+
+func TestNewRouterRejectsMissingConfig(t *testing.T) {
+	config := newRouterConfig(&bytes.Buffer{})
+	config.Auth = nil
+	config.Orders = nil
+
+	router, err := httptransport.NewRouter(config)
+	if router != nil {
+		t.Fatal("при ошибке конфигурации возвращён маршрутизатор")
+	}
+
+	if !errors.Is(err, httptransport.ErrMissingRouterConfig) {
+		t.Fatalf("ожидалась ошибка %v, получено: %v", httptransport.ErrMissingRouterConfig, err)
+	}
+
+	// Каждое незаполненное поле сообщается отдельной ошибкой: сборка не
+	// останавливается на первой найденной проблеме.
+	var joined interface{ Unwrap() []error }
+	if !errors.As(err, &joined) {
+		t.Fatalf("ошибка не объединяет проблемы отдельных полей: %v", err)
+	}
+
+	if got := len(joined.Unwrap()); got != 2 {
+		t.Errorf("сообщено проблем: %d, ожидалось 2: %v", got, err)
+	}
+}
+
+func TestNewRouterRejectsNonPositiveBodyLimit(t *testing.T) {
+	tests := []struct {
+		name  string
+		limit int64
+	}{
+		{name: "ноль", limit: 0},
+		{name: "отрицательное значение", limit: -1},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := newRouterConfig(&bytes.Buffer{})
+			config.MaxRequestBodyBytes = test.limit
+
+			router, err := httptransport.NewRouter(config)
+			if router != nil {
+				t.Fatal("при неположительном лимите возвращён маршрутизатор")
+			}
+
+			if !errors.Is(err, httptransport.ErrMissingRouterConfig) {
+				t.Fatalf("неположительный лимит не отклонён: %v", err)
+			}
+		})
+	}
 }
 
 func TestRouterReturnsNotFoundForUnknownPath(t *testing.T) {
@@ -151,10 +246,11 @@ func TestRouterLogsRealStatusWhenResponseCompressed(t *testing.T) {
 func TestRouterRecoversFromPanicInHandler(t *testing.T) {
 	logs := &bytes.Buffer{}
 
-	router := httptransport.NewRouter(httptransport.RouterConfig{
-		Logger:              slog.New(slog.NewJSONHandler(logs, nil)),
-		MaxRequestBodyBytes: routerBodyLimit,
-	})
+	config := newRouterConfig(logs)
+	router, err := httptransport.NewRouter(config)
+	if err != nil {
+		t.Fatalf("сборка маршрутизатора: %v", err)
+	}
 
 	router.Get("/panic", func(http.ResponseWriter, *http.Request) {
 		panic("падение обработчика")
@@ -188,10 +284,10 @@ func TestRouterAppliesMiddlewareWithoutRegisteredRoutes(t *testing.T) {
 
 	// Маршруты намеренно не регистрируются: цепочка сквозных обработчиков
 	// обязана работать и на «пустом» сервисе.
-	router := httptransport.NewRouter(httptransport.RouterConfig{
-		Logger:              slog.New(slog.NewJSONHandler(logs, nil)),
-		MaxRequestBodyBytes: routerBodyLimit,
-	})
+	router, err := httptransport.NewRouter(newRouterConfig(logs))
+	if err != nil {
+		t.Fatalf("сборка маршрутизатора: %v", err)
+	}
 
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
 	request.Header.Set("Accept-Encoding", "gzip")

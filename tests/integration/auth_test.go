@@ -1,6 +1,7 @@
 package integration_test
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"gophermart/internal/auth"
+	"gophermart/internal/domain"
 	"gophermart/internal/service"
 	"gophermart/internal/storage/postgres"
 	httptransport "gophermart/internal/transport/http"
@@ -25,6 +27,21 @@ import (
 // authRouterTokenTTL — срок действия токена, используемый сквозными тестами
 // аутентификации.
 const authRouterTokenTTL = time.Hour
+
+// stubOrderService — заглушка сервиса заказов для тестов аутентификации.
+//
+// Маршруты заказов обязательны при сборке маршрутизатора, но в этих тестах не
+// используются. Заглушка вместо nil-сервиса даёт им отвечать пустым списком, а
+// не аварийно завершать процесс.
+type stubOrderService struct{}
+
+func (stubOrderService) Upload(context.Context, domain.OrderNumber, domain.UserID) (domain.OrderUpload, error) {
+	return domain.OrderUploadAccepted, nil
+}
+
+func (stubOrderService) List(context.Context, domain.UserID) ([]domain.Order, error) {
+	return []domain.Order{}, nil
+}
 
 // newAuthRouter собирает маршрутизатор с реальным сервисом аутентификации
 // поверх свежей базы данных и регистрирует тестовый защищённый маршрут,
@@ -60,12 +77,16 @@ func newAuthRouter(t *testing.T) *httptransport.Router {
 
 	authService := service.NewAuth(postgres.NewUserRepository(pool), hasher, tokens)
 
-	router := httptransport.NewRouter(httptransport.RouterConfig{
+	router, err := httptransport.NewRouter(httptransport.RouterConfig{
 		Logger:              slog.New(slog.DiscardHandler),
 		MaxRequestBodyBytes: 1 << 20,
 		Auth:                handlers.NewAuth(authService, authRouterTokenTTL),
+		Orders:              handlers.NewOrders(stubOrderService{}),
 		Authenticator:       authService,
 	})
+	if err != nil {
+		t.Fatalf("сборка маршрутизатора: %v", err)
+	}
 
 	router.Protected().Get("/api/user/test-protected", func(w http.ResponseWriter, r *http.Request) {
 		userID, ok := middleware.UserIDFromContext(r.Context())

@@ -90,5 +90,5 @@ func newRouter(cfg Config, logger *slog.Logger, pool *pgxpool.Pool) (*httptransp
 		Auth:                handlers.NewAuth(authService, cfg.TokenTTL),
 		Orders:              handlers.NewOrders(orderService),
 		Authenticator:       authService,
-	}), nil
+	})
 }

@@ -57,13 +57,16 @@ func newOrdersRouter(t *testing.T) (*httptransport.Router, *pgxpool.Pool) {
 	authService := service.NewAuth(postgres.NewUserRepository(pool), hasher, tokens)
 	orderService := service.NewOrders(postgres.NewOrderRepository(pool))
 
-	router := httptransport.NewRouter(httptransport.RouterConfig{
+	router, err := httptransport.NewRouter(httptransport.RouterConfig{
 		Logger:              slog.New(slog.DiscardHandler),
 		MaxRequestBodyBytes: 1 << 20,
 		Auth:                handlers.NewAuth(authService, authRouterTokenTTL),
 		Orders:              handlers.NewOrders(orderService),
 		Authenticator:       authService,
 	})
+	if err != nil {
+		t.Fatalf("сборка маршрутизатора: %v", err)
+	}
 
 	return router, pool
 }
