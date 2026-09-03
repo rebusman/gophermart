@@ -1,0 +1,13 @@
+# Конфигурация проверки OpenAPI-контракта.
+#
+# Запуск: make openapi-lint
+extends:
+  - recommended
+
+rules:
+  info-license: off
+  no-server-example.com: off
+
+apis:
+  gophermart:
+    root: ./openapi.yaml

@@ -1,0 +1,533 @@
+openapi: 3.0.3
+
+info:
+  title: Gophermart — накопительная система лояльности
+  version: 1.0.0
+  description: |
+    HTTP API накопительной системы лояльности «Гофермарт».
+
+    Контракт зафиксирован техническим заданием ([`ToR.md`](../ToR.md)) и является
+    источником истины для обработчиков: маршруты, коды ответа и имена JSON-полей
+    не меняются без явной причины и обновления этого документа.
+
+    # Аутентификация
+
+    Регистрация и вход возвращают токен доступа **двумя способами одновременно**:
+    в заголовке ответа `Authorization` со значением `Bearer <token>` и в cookie
+    `auth_token`. Техническое задание допускает любой из этих способов, а
+    одновременная выдача снимает зависимость от того, какой из них читает клиент.
+
+    Защищённые эндпоинты принимают токен из заголовка `Authorization`, а при его
+    отсутствии — из cookie. Если присутствуют оба источника, проверяется значение
+    из заголовка.
+
+    Cookie помечена как `HttpOnly` и не помечена как `Secure`: сервис
+    обслуживает запросы по обычному HTTP, и флаг `Secure` привёл бы к тому, что
+    клиент отбросил бы cookie.
+
+    # Сжатие
+
+    Сервис сжимает тело ответа алгоритмом gzip, если клиент передал
+    `Accept-Encoding: gzip`, и принимает сжатое тело запроса при
+    `Content-Encoding: gzip`. Ответ, содержимое которого зависит от кодировки,
+    содержит заголовок `Vary: Accept-Encoding`. Повреждённый gzip-поток в теле
+    запроса приводит к коду `400`.
+
+    # Денежные значения
+
+    Баллы лояльности передаются как JSON-**числа** с точностью до двух знаков
+    после запятой, например `751.5`. Строковое представление недопустимо.
+
+    # Идентификаторы запросов
+
+    Каждый ответ содержит заголовок `X-Request-Id`. Если клиент передал этот
+    заголовок в запросе, возвращается его значение, иначе — сгенерированное.
+
+    # Тела ответов об ошибках
+
+    Ответы с кодами `4xx` и `5xx` содержат тело `text/plain` со стандартным
+    описанием кода состояния. Тексты ошибок PostgreSQL, stack trace, строка
+    подключения и секреты клиенту не раскрываются.
+
+servers:
+  - url: http://localhost:8080
+    description: Локальный запуск
+
+tags:
+  - name: Пользователь
+    description: Регистрация и аутентификация
+  - name: Заказы
+    description: Загрузка номеров заказов и просмотр их статусов
+  - name: Баланс
+    description: Баланс баллов лояльности и списания
+
+paths:
+  /api/user/register:
+    post:
+      tags: [Пользователь]
+      summary: Регистрация пользователя
+      description: |
+        Регистрирует пользователя по паре логин/пароль и сразу его
+        аутентифицирует. Каждый логин уникален.
+      operationId: registerUser
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Credentials'
+      responses:
+        '200':
+          description: Пользователь зарегистрирован и аутентифицирован
+          headers:
+            Authorization:
+              $ref: '#/components/headers/AuthorizationToken'
+            Set-Cookie:
+              $ref: '#/components/headers/AuthCookie'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestID'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Логин уже занят
+          content:
+            text/plain:
+              schema:
+                type: string
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/user/login:
+    post:
+      tags: [Пользователь]
+      summary: Аутентификация пользователя
+      description: Проверяет пару логин/пароль и выпускает новый токен доступа.
+      operationId: loginUser
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Credentials'
+      responses:
+        '200':
+          description: Пользователь аутентифицирован
+          headers:
+            Authorization:
+              $ref: '#/components/headers/AuthorizationToken'
+            Set-Cookie:
+              $ref: '#/components/headers/AuthCookie'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestID'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: |
+            Неверная пара логин/пароль. Ответ не позволяет отличить
+            несуществующий логин от неверного пароля.
+          content:
+            text/plain:
+              schema:
+                type: string
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/user/orders:
+    post:
+      tags: [Заказы]
+      summary: Загрузка номера заказа
+      description: |
+        Принимает номер заказа для расчёта начислений. Тело запроса — номер
+        заказа в виде последовательности цифр произвольной длины, передаваемой
+        как `text/plain`.
+
+        Номер проверяется алгоритмом Луна. Номер заказа уникален глобально:
+        повторная загрузка тем же пользователем возвращает `200`, загрузка
+        номера, принадлежащего другому пользователю, — `409`.
+
+        Система расчёта начислений синхронно не вызывается: новый заказ
+        создаётся в статусе `NEW`, а расчёт выполняется фоновым процессом.
+      operationId: uploadOrder
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              $ref: '#/components/schemas/OrderNumber'
+      responses:
+        '200':
+          description: Номер заказа уже был загружен этим пользователем
+          content:
+            text/plain:
+              schema:
+                type: string
+        '202':
+          description: Новый номер заказа принят в обработку
+          content:
+            text/plain:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Номер заказа уже был загружен другим пользователем
+          content:
+            text/plain:
+              schema:
+                type: string
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '422':
+          description: Неверный формат номера заказа
+          content:
+            text/plain:
+              schema:
+                type: string
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    get:
+      tags: [Заказы]
+      summary: Список загруженных номеров заказов
+      description: |
+        Возвращает заказы пользователя, отсортированные по времени загрузки от
+        самых новых к самым старым.
+      operationId: listOrders
+      responses:
+        '200':
+          description: Список заказов
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                type: array
+                minItems: 1
+                items:
+                  $ref: '#/components/schemas/Order'
+              example:
+                - number: '9278923470'
+                  status: PROCESSED
+                  accrual: 500
+                  uploaded_at: '2020-12-10T15:15:45+03:00'
+                - number: '12345678903'
+                  status: PROCESSING
+                  uploaded_at: '2020-12-10T15:12:01+03:00'
+                - number: '346436439'
+                  status: INVALID
+                  uploaded_at: '2020-12-09T16:09:53+03:00'
+        '204':
+          description: У пользователя нет загруженных заказов
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/user/balance:
+    get:
+      tags: [Баланс]
+      summary: Текущий баланс пользователя
+      description: |
+        Возвращает текущую сумму баллов лояльности и сумму баллов, списанных за
+        весь период регистрации.
+      operationId: getBalance
+      responses:
+        '200':
+          description: Баланс пользователя
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Balance'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/user/balance/withdraw:
+    post:
+      tags: [Баланс]
+      summary: Списание баллов
+      description: |
+        Списывает баллы в счёт оплаты нового заказа. Номер заказа гипотетический:
+        он проверяется алгоритмом Луна, но не обязан существовать среди
+        загруженных заказов.
+
+        Проверка достаточности баллов и само списание выполняются атомарно.
+        Повторный запрос с тем же номером заказа от того же пользователя
+        возвращает `200` и не списывает баллы второй раз.
+      operationId: withdrawBalance
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WithdrawRequest'
+      responses:
+        '200':
+          description: Списание выполнено либо уже было выполнено ранее
+          content:
+            text/plain:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          description: На счету недостаточно баллов; изменения не сохранены
+          content:
+            text/plain:
+              schema:
+                type: string
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '422':
+          description: Неверный номер заказа
+          content:
+            text/plain:
+              schema:
+                type: string
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/user/withdrawals:
+    get:
+      tags: [Баланс]
+      summary: История списаний
+      description: |
+        Возвращает списания пользователя, отсортированные по времени списания от
+        самых новых к самым старым.
+      operationId: listWithdrawals
+      responses:
+        '200':
+          description: История списаний
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                type: array
+                minItems: 1
+                items:
+                  $ref: '#/components/schemas/Withdrawal'
+              example:
+                - order: '2377225624'
+                  sum: 500
+                  processed_at: '2020-12-09T16:09:57+03:00'
+        '204':
+          description: У пользователя нет ни одного списания
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Токен доступа в заголовке `Authorization`. Имеет приоритет над cookie.
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: auth_token
+      description: Токен доступа в cookie. Используется, если заголовок `Authorization` отсутствует.
+
+  headers:
+    AuthorizationToken:
+      description: |
+        Выпущенный токен доступа в формате `Bearer <token>`. Возвращается вместе
+        с cookie: клиент может использовать любой из способов.
+      schema:
+        type: string
+      example: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+    AuthCookie:
+      description: |
+        Cookie `auth_token` с тем же токеном. Помечена `HttpOnly`, флаг `Secure`
+        не выставляется, поскольку сервис работает по HTTP.
+      schema:
+        type: string
+      example: auth_token=eyJhbGciOiJIUzI1NiJ9...; Path=/; HttpOnly; SameSite=Lax
+    RequestID:
+      description: |
+        Идентификатор запроса. Совпадает со значением `X-Request-Id` из запроса,
+        если клиент его передал, иначе сгенерирован сервисом.
+      schema:
+        type: string
+      example: af01524be117dd71f44539a2117d4a44
+
+  responses:
+    BadRequest:
+      description: Неверный формат запроса
+      content:
+        text/plain:
+          schema:
+            type: string
+    Unauthorized:
+      description: Пользователь не аутентифицирован
+      content:
+        text/plain:
+          schema:
+            type: string
+    PayloadTooLarge:
+      description: |
+        Тело запроса превышает допустимый размер. Код не предусмотрен техническим
+        заданием и является защитным ограничением реализации: лимит заведомо
+        превышает размер любого легитимного запроса контракта.
+      content:
+        text/plain:
+          schema:
+            type: string
+    InternalServerError:
+      description: Внутренняя ошибка сервера
+      content:
+        text/plain:
+          schema:
+            type: string
+
+  schemas:
+    Credentials:
+      type: object
+      description: Пара логин/пароль.
+      required: [login, password]
+      properties:
+        login:
+          type: string
+          minLength: 1
+          description: Логин пользователя. Уникален, сравнивается с учётом регистра.
+          example: gopher
+        password:
+          type: string
+          minLength: 1
+          maxLength: 72
+          format: password
+          description: |
+            Пароль в открытом виде. Хранится только в виде адаптивного хеша.
+            Ограничение длины продиктовано алгоритмом хеширования: bcrypt
+            использует лишь первые 72 байта пароля, поэтому более длинное
+            значение отклоняется, а не усекается молча.
+          example: correct-horse-battery-staple
+
+    OrderNumber:
+      type: string
+      pattern: '^[0-9]+$'
+      description: |
+        Номер заказа: последовательность цифр произвольной длины, проходящая
+        проверку алгоритмом Луна.
+      example: '12345678903'
+
+    OrderStatus:
+      type: string
+      description: |
+        Статус расчёта начисления.
+
+        Значения `INVALID` и `PROCESSED` окончательны: заказы в этих статусах
+        больше не опрашиваются.
+      enum: [NEW, PROCESSING, INVALID, PROCESSED]
+      x-enum-descriptions:
+        NEW: Заказ загружен в систему, но не попал в обработку
+        PROCESSING: Вознаграждение за заказ рассчитывается
+        INVALID: Система расчёта вознаграждений отказала в расчёте
+        PROCESSED: Данные по заказу проверены, информация о расчёте получена
+
+    Money:
+      type: number
+      multipleOf: 0.01
+      description: |
+        Сумма баллов лояльности. Передаётся как JSON-число с точностью до двух
+        знаков после запятой. Один балл равен одной единице местной валюты.
+      example: 751.5
+
+    Order:
+      type: object
+      description: Загруженный номер заказа и результат его обработки.
+      required: [number, status, uploaded_at]
+      properties:
+        number:
+          $ref: '#/components/schemas/OrderNumber'
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        accrual:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          minimum: 0
+          description: |
+            Начисленные баллы. Поле **отсутствует**, если начисления нет: заказ
+            может быть завершён в статусе `PROCESSED` без вознаграждения.
+            Значение `0` и отсутствие поля не эквивалентны.
+        uploaded_at:
+          type: string
+          format: date-time
+          description: Время загрузки номера заказа в формате RFC3339.
+          example: '2020-12-10T15:15:45+03:00'
+
+    Balance:
+      type: object
+      description: Состояние счёта баллов лояльности.
+      required: [current, withdrawn]
+      properties:
+        current:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          minimum: 0
+          description: Текущая сумма баллов. Не может быть отрицательной.
+          example: 500.5
+        withdrawn:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          minimum: 0
+          description: Сумма баллов, списанных за весь период регистрации.
+          example: 42
+
+    WithdrawRequest:
+      type: object
+      description: Запрос на списание баллов в счёт оплаты нового заказа.
+      required: [order, sum]
+      properties:
+        order:
+          $ref: '#/components/schemas/OrderNumber'
+        sum:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          minimum: 0
+          exclusiveMinimum: true
+          description: Сумма баллов к списанию. Должна быть положительной.
+          example: 751.5
+
+    Withdrawal:
+      type: object
+      description: Факт списания баллов.
+      required: [order, sum, processed_at]
+      properties:
+        order:
+          $ref: '#/components/schemas/OrderNumber'
+        sum:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          minimum: 0
+          exclusiveMinimum: true
+          description: Списанная сумма баллов.
+          example: 500
+        processed_at:
+          type: string
+          format: date-time
+          description: Время списания в формате RFC3339.
+          example: '2020-12-09T16:09:57+03:00'
+
+security:
+  - bearerAuth: []
+  - cookieAuth: []
