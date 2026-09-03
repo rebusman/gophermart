@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
+
+	"github.com/shopspring/decimal"
 
 	"gophermart/internal/domain"
 )
@@ -222,4 +225,141 @@ func (s *balanceRepositoryStub) WithdrawalsByUser(
 	}
 
 	return s.withdrawals, nil
+}
+
+// Ошибки, воспроизводящие недружественные исходы обращения к внешней системе.
+//
+// Тексты имитируют реальные причины, но сами значения объявлены здесь: сервис
+// не должен зависеть от того, какие именно ошибки возвращает конкретный
+// клиент, — он различает только превышение лимита запросов и всё остальное.
+var (
+	errOrderNotRegistered = errors.New("заказ не зарегистрирован в системе расчёта")
+	errExternalFailure    = errors.New("внешняя система расчёта ответила ошибкой")
+	errNetwork            = errors.New("соединение разорвано")
+	errUnknownStatus      = errors.New("внешняя система расчёта вернула неизвестный статус")
+)
+
+// accrualClientStub подменяет клиента внешней системы расчёта.
+type accrualClientStub struct {
+	result domain.AccrualResult
+	err    error
+
+	calls      int
+	gotNumbers []domain.OrderNumber
+}
+
+func (s *accrualClientStub) OrderAccrual(
+	_ context.Context,
+	number domain.OrderNumber,
+) (domain.AccrualResult, error) {
+	s.calls++
+	s.gotNumbers = append(s.gotNumbers, number)
+
+	if s.err != nil {
+		return domain.AccrualResult{}, s.err
+	}
+
+	return s.result, nil
+}
+
+// appliedResult фиксирует аргументы одного применения результата расчёта.
+type appliedResult struct {
+	job     domain.AccrualJob
+	status  domain.OrderStatus
+	accrual *decimal.Decimal
+}
+
+// accrualRepositoryStub подменяет хранилище фонового расчёта в юнит-тестах.
+//
+// Счётчики позволяют убедиться, что каждый исход обращения приводит ровно к
+// той операции над заказом, которая ему соответствует, и ни к какой другой.
+type accrualRepositoryStub struct {
+	jobs     []domain.AccrualJob
+	claimErr error
+
+	applied  bool
+	applyErr error
+
+	processingErr error
+	rescheduleErr error
+	releaseErr    error
+
+	claimedBatch int
+	claimedLease time.Duration
+
+	appliedResults []appliedResult
+
+	processingCalls int
+	processingDelay time.Duration
+
+	rescheduleCalls int
+	rescheduleDelay time.Duration
+
+	releaseCalls    int
+	releasedNumbers []domain.OrderNumber
+	releaseDelay    time.Duration
+}
+
+func (s *accrualRepositoryStub) ClaimAccrualJobs(
+	_ context.Context,
+	batchSize int,
+	lease time.Duration,
+) ([]domain.AccrualJob, error) {
+	s.claimedBatch = batchSize
+	s.claimedLease = lease
+
+	if s.claimErr != nil {
+		return nil, s.claimErr
+	}
+
+	return s.jobs, nil
+}
+
+func (s *accrualRepositoryStub) ApplyAccrual(
+	_ context.Context,
+	job domain.AccrualJob,
+	status domain.OrderStatus,
+	accrual *decimal.Decimal,
+) (bool, error) {
+	if s.applyErr != nil {
+		return false, s.applyErr
+	}
+
+	s.appliedResults = append(s.appliedResults, appliedResult{job: job, status: status, accrual: accrual})
+
+	return s.applied, nil
+}
+
+func (s *accrualRepositoryStub) MarkAccrualProcessing(
+	_ context.Context,
+	_ domain.OrderNumber,
+	delay time.Duration,
+) error {
+	s.processingCalls++
+	s.processingDelay = delay
+
+	return s.processingErr
+}
+
+func (s *accrualRepositoryStub) RescheduleAccrualJob(
+	_ context.Context,
+	_ domain.OrderNumber,
+	delay time.Duration,
+) error {
+	s.rescheduleCalls++
+	s.rescheduleDelay = delay
+
+	return s.rescheduleErr
+}
+
+func (s *accrualRepositoryStub) ReleaseAccrualJobs(
+	_ context.Context,
+	numbers []domain.OrderNumber,
+	delay time.Duration,
+) error {
+	s.releaseCalls++
+	s.releasedNumbers = numbers
+	s.releaseDelay = delay
+
+	return s.releaseErr
 }

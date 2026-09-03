@@ -40,6 +40,22 @@ const (
 
 	DefaultTokenTTL = 24 * time.Hour
 
+	// DefaultAccrualPollInterval — пауза между циклами опроса внешней системы
+	DefaultAccrualPollInterval = time.Second
+
+	// DefaultAccrualBatchSize — число заданий, выбираемых за один цикл.
+	DefaultAccrualBatchSize = 32
+
+	DefaultAccrualRequestTimeout = 5 * time.Second
+
+	DefaultAccrualLeaseDuration = 30 * time.Second
+
+	DefaultAccrualBackoffBase = 5 * time.Second
+
+	DefaultAccrualBackoffCap = 5 * time.Minute
+
+	DefaultAccrualRetryAfter = 60 * time.Second
+
 	// DefaultLogLevel — уровень журналирования по умолчанию.
 	DefaultLogLevel = slog.LevelInfo
 
@@ -66,6 +82,27 @@ const (
 
 	// EnvTokenTTL задаёт срок действия токена доступа.
 	EnvTokenTTL = "TOKEN_TTL"
+
+	// EnvAccrualPollInterval задаёт паузу между циклами опроса внешней системы
+	EnvAccrualPollInterval = "ACCRUAL_POLL_INTERVAL"
+
+	// EnvAccrualBatchSize задаёт число заданий, выбираемых за один цикл.
+	EnvAccrualBatchSize = "ACCRUAL_BATCH_SIZE"
+
+	// EnvAccrualRequestTimeout задаёт предельное время обращения к внешней
+	EnvAccrualRequestTimeout = "ACCRUAL_REQUEST_TIMEOUT"
+
+	// EnvAccrualLeaseDuration задаёт срок аренды выбранного задания.
+	EnvAccrualLeaseDuration = "ACCRUAL_LEASE_DURATION"
+
+	// EnvAccrualBackoffBase задаёт начальную отсрочку повторной проверки.
+	EnvAccrualBackoffBase = "ACCRUAL_BACKOFF_BASE"
+
+	// EnvAccrualBackoffCap задаёт потолок отсрочки повторной проверки.
+	EnvAccrualBackoffCap = "ACCRUAL_BACKOFF_CAP"
+
+	// EnvAccrualRetryAfter задаёт паузу при превышении лимита запросов, когда
+	EnvAccrualRetryAfter = "ACCRUAL_RETRY_AFTER"
 
 	// EnvLogLevel задаёт уровень журналирования.
 	EnvLogLevel = "LOG_LEVEL"
@@ -133,6 +170,27 @@ type Config struct {
 
 	// TokenTTL — срок действия выпускаемых токенов доступа, переменная
 	TokenTTL time.Duration
+
+	// AccrualPollInterval — пауза между циклами опроса внешней системы
+	AccrualPollInterval time.Duration
+
+	// AccrualBatchSize — число заданий, выбираемых за один цикл, переменная
+	AccrualBatchSize int
+
+	// AccrualRequestTimeout — предельное время одного обращения к внешней
+	AccrualRequestTimeout time.Duration
+
+	// AccrualLeaseDuration — срок аренды выбранного задания, переменная
+	AccrualLeaseDuration time.Duration
+
+	// AccrualBackoffBase — начальная отсрочка повторной проверки заказа после
+	AccrualBackoffBase time.Duration
+
+	// AccrualBackoffCap — потолок отсрочки повторной проверки заказа,
+	AccrualBackoffCap time.Duration
+
+	// AccrualRetryAfter — пауза опроса при превышении лимита запросов, когда
+	AccrualRetryAfter time.Duration
 }
 
 // LoadConfig собирает конфигурацию из аргументов командной строки и переменных
@@ -155,6 +213,13 @@ func LoadConfig(args []string, lookupEnv func(string) (string, bool)) (Config, e
 		DatabaseConnectTimeout: DefaultDatabaseConnectTimeout,
 		PasswordHashCost:       DefaultPasswordHashCost,
 		TokenTTL:               DefaultTokenTTL,
+		AccrualPollInterval:    DefaultAccrualPollInterval,
+		AccrualBatchSize:       DefaultAccrualBatchSize,
+		AccrualRequestTimeout:  DefaultAccrualRequestTimeout,
+		AccrualLeaseDuration:   DefaultAccrualLeaseDuration,
+		AccrualBackoffBase:     DefaultAccrualBackoffBase,
+		AccrualBackoffCap:      DefaultAccrualBackoffCap,
+		AccrualRetryAfter:      DefaultAccrualRetryAfter,
 	}
 
 	if raw, ok := env.Lookup(EnvLogLevel); ok {
@@ -182,6 +247,10 @@ func LoadConfig(args []string, lookupEnv func(string) (string, bool)) (Config, e
 		}
 
 		cfg.TokenTTL = ttl
+	}
+
+	if err := applyAccrualEnv(&cfg, env); err != nil {
+		return Config{}, err
 	}
 
 	if err := applyFlags(&cfg, args); err != nil {
@@ -217,6 +286,13 @@ func (c Config) LogValue() slog.Value {
 		slog.String("log_format", c.LogFormat),
 		slog.Int("password_hash_cost", c.PasswordHashCost),
 		slog.Duration("token_ttl", c.TokenTTL),
+		slog.Duration("accrual_poll_interval", c.AccrualPollInterval),
+		slog.Int("accrual_batch_size", c.AccrualBatchSize),
+		slog.Duration("accrual_request_timeout", c.AccrualRequestTimeout),
+		slog.Duration("accrual_lease_duration", c.AccrualLeaseDuration),
+		slog.Duration("accrual_backoff_base", c.AccrualBackoffBase),
+		slog.Duration("accrual_backoff_cap", c.AccrualBackoffCap),
+		slog.Duration("accrual_retry_after", c.AccrualRetryAfter),
 	)
 }
 
@@ -251,6 +327,88 @@ func (c Config) validate() error {
 		return fmt.Errorf(
 			"недопустимый формат журнала %q: ожидается %q или %q",
 			c.LogFormat, logging.FormatJSON, logging.FormatText,
+		)
+	}
+
+	return c.validateAccrual()
+}
+
+// accrualDurations сопоставляет переменной окружения поле конфигурации,
+func accrualDurations(cfg *Config) map[string]*time.Duration {
+	return map[string]*time.Duration{
+		EnvAccrualPollInterval:   &cfg.AccrualPollInterval,
+		EnvAccrualRequestTimeout: &cfg.AccrualRequestTimeout,
+		EnvAccrualLeaseDuration:  &cfg.AccrualLeaseDuration,
+		EnvAccrualBackoffBase:    &cfg.AccrualBackoffBase,
+		EnvAccrualBackoffCap:     &cfg.AccrualBackoffCap,
+		EnvAccrualRetryAfter:     &cfg.AccrualRetryAfter,
+	}
+}
+
+// applyAccrualEnv читает параметры фонового расчёта из окружения поверх
+func applyAccrualEnv(cfg *Config, env envReader) error {
+	for key, field := range accrualDurations(cfg) {
+		raw, ok := env.Lookup(key)
+		if !ok {
+			continue
+		}
+
+		value, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("недопустимое значение %s %q: %w", key, raw, err)
+		}
+
+		*field = value
+	}
+
+	if raw, ok := env.Lookup(EnvAccrualBatchSize); ok {
+		size, err := strconv.Atoi(raw)
+		if err != nil {
+			return fmt.Errorf("недопустимое значение %s %q: %w", EnvAccrualBatchSize, raw, err)
+		}
+
+		cfg.AccrualBatchSize = size
+	}
+
+	return nil
+}
+
+// validateAccrual проверяет параметры фонового расчёта.
+func (c Config) validateAccrual() error {
+	positive := map[string]time.Duration{
+		EnvAccrualPollInterval:   c.AccrualPollInterval,
+		EnvAccrualRequestTimeout: c.AccrualRequestTimeout,
+		EnvAccrualLeaseDuration:  c.AccrualLeaseDuration,
+		EnvAccrualBackoffBase:    c.AccrualBackoffBase,
+		EnvAccrualBackoffCap:     c.AccrualBackoffCap,
+		EnvAccrualRetryAfter:     c.AccrualRetryAfter,
+	}
+
+	for key, value := range positive {
+		if value <= 0 {
+			return fmt.Errorf("недопустимое значение %s %s: ожидается положительная длительность", key, value)
+		}
+	}
+
+	if c.AccrualBatchSize <= 0 {
+		return fmt.Errorf(
+			"недопустимое значение %s %d: ожидается положительное число",
+			EnvAccrualBatchSize, c.AccrualBatchSize,
+		)
+	}
+
+	if c.AccrualBackoffCap < c.AccrualBackoffBase {
+		return fmt.Errorf(
+			"потолок отсрочки %s меньше её базы %s: рост отсрочки невозможен",
+			c.AccrualBackoffCap, c.AccrualBackoffBase,
+		)
+	}
+
+	if c.AccrualLeaseDuration <= c.AccrualRequestTimeout {
+		return fmt.Errorf(
+			"срок аренды задания %s не превышает предельное время обращения %s: "+
+				"аренда истечёт до завершения вызова, и задание возьмёт другой экземпляр",
+			c.AccrualLeaseDuration, c.AccrualRequestTimeout,
 		)
 	}
 

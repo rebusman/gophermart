@@ -42,6 +42,9 @@ var (
 	// ErrBalanceNotFound возвращается хранилищем, когда счёта лояльности с
 	ErrBalanceNotFound = errors.New("счёт лояльности не найден")
 
+	// ErrAccrualRateLimited возвращается, когда внешняя система расчёта
+	ErrAccrualRateLimited = errors.New("внешняя система расчёта отклонила обращение по лимиту запросов")
+
 	// ErrEmptyLogin возвращается, когда логин отсутствует, пуст или состоит
 	ErrEmptyLogin = errors.New("логин не задан")
 

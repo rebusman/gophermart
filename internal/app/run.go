@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 
+	"gophermart/internal/accrual"
 	"gophermart/internal/auth"
 	"gophermart/internal/logging"
 	"gophermart/internal/service"
@@ -55,10 +56,20 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 		return fmt.Errorf("сборка маршрутизатора: %w", err)
 	}
 
+	worker, err := newAccrualWorker(cfg, logger, pool)
+	if err != nil {
+		return fmt.Errorf("сборка фонового расчёта начислений: %w", err)
+	}
+
 	application, err := New(ctx, cfg, logger, router)
 	if err != nil {
 		return fmt.Errorf("инициализация приложения: %w", err)
 	}
+
+	application.AddBackgroundTask(BackgroundTask{
+		Name: accrual.BackgroundTaskName,
+		Run:  worker.Run,
+	})
 
 	if err = application.Serve(ctx); err != nil {
 		return fmt.Errorf("работа приложения: %w", err)
@@ -67,6 +78,32 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	logger.InfoContext(ctx, "сервис остановлен")
 
 	return nil
+}
+
+// newAccrualWorker собирает фоновый воркер расчёта начислений вместе с его
+func newAccrualWorker(cfg Config, logger *slog.Logger, pool *pgxpool.Pool) (*accrual.Worker, error) {
+	client, err := accrual.NewClient(cfg.AccrualSystemAddress, cfg.AccrualRequestTimeout, cfg.AccrualRetryAfter)
+	if err != nil {
+		return nil, fmt.Errorf("инициализация клиента системы расчёта: %w", err)
+	}
+
+	service := service.NewAccruals(postgres.NewOrderRepository(pool), client, service.AccrualsConfig{
+		BackoffBase:  cfg.AccrualBackoffBase,
+		BackoffCap:   cfg.AccrualBackoffCap,
+		PollInterval: cfg.AccrualPollInterval,
+	})
+
+	workerCfg := accrual.WorkerConfig{
+		PollInterval:  cfg.AccrualPollInterval,
+		BatchSize:     cfg.AccrualBatchSize,
+		LeaseDuration: cfg.AccrualLeaseDuration,
+	}
+
+	if err = workerCfg.Validate(); err != nil {
+		return nil, err
+	}
+
+	return accrual.NewWorker(service, logger, workerCfg), nil
 }
 
 // newRouter собирает маршрутизатор вместе со всеми зависимостями обработчиков.

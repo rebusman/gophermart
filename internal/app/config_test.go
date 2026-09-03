@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"gophermart/internal/app"
 )
@@ -252,5 +253,189 @@ func TestInvalidLogFormat(t *testing.T) {
 
 	if _, err := app.LoadConfig(nil, envOf(env)); err == nil {
 		t.Error("ожидалась ошибка недопустимого формата журнала")
+	}
+}
+
+// TestAccrualDefaultsApplyWithoutAnyEnvironment закрепляет сценарий «Запуск без
+// явных параметров расчёта»: сервис стартует, не зная ни одного параметра
+// цикла, а конфигурация получает осмысленные значения по умолчанию.
+func TestAccrualDefaultsApplyWithoutAnyEnvironment(t *testing.T) {
+	cfg, err := app.LoadConfig(nil, envOf(requiredEnv()))
+	if err != nil {
+		t.Fatalf("разбор конфигурации: %v", err)
+	}
+
+	durations := map[string]struct {
+		got  time.Duration
+		want time.Duration
+	}{
+		"интервал опроса":    {cfg.AccrualPollInterval, app.DefaultAccrualPollInterval},
+		"время обращения":    {cfg.AccrualRequestTimeout, app.DefaultAccrualRequestTimeout},
+		"срок аренды":        {cfg.AccrualLeaseDuration, app.DefaultAccrualLeaseDuration},
+		"база отсрочки":      {cfg.AccrualBackoffBase, app.DefaultAccrualBackoffBase},
+		"потолок отсрочки":   {cfg.AccrualBackoffCap, app.DefaultAccrualBackoffCap},
+		"пауза по умолчанию": {cfg.AccrualRetryAfter, app.DefaultAccrualRetryAfter},
+	}
+
+	for name, test := range durations {
+		if test.got != test.want {
+			t.Errorf("%s: got %s, want %s", name, test.got, test.want)
+		}
+	}
+
+	if cfg.AccrualBatchSize != app.DefaultAccrualBatchSize {
+		t.Errorf("размер порции: got %d, want %d", cfg.AccrualBatchSize, app.DefaultAccrualBatchSize)
+	}
+
+	// Соотношение, от которого зависит осмысленность аренды, обязано
+	// выполняться уже на значениях по умолчанию.
+	if cfg.AccrualLeaseDuration <= cfg.AccrualRequestTimeout {
+		t.Errorf("срок аренды по умолчанию %s не превышает время обращения %s",
+			cfg.AccrualLeaseDuration, cfg.AccrualRequestTimeout)
+	}
+}
+
+// TestAccrualParametersFromEnvironment закрепляет чтение каждого параметра
+// цикла из переменной окружения.
+func TestAccrualParametersFromEnvironment(t *testing.T) {
+	env := requiredEnv()
+	env[app.EnvAccrualPollInterval] = "2s"
+	env[app.EnvAccrualRequestTimeout] = "3s"
+	env[app.EnvAccrualLeaseDuration] = "17s"
+	env[app.EnvAccrualBackoffBase] = "4s"
+	env[app.EnvAccrualBackoffCap] = "9m"
+	env[app.EnvAccrualRetryAfter] = "45s"
+	env[app.EnvAccrualBatchSize] = "7"
+
+	cfg, err := app.LoadConfig(nil, envOf(env))
+	if err != nil {
+		t.Fatalf("разбор конфигурации: %v", err)
+	}
+
+	tests := map[string]struct {
+		got  time.Duration
+		want time.Duration
+	}{
+		app.EnvAccrualPollInterval:   {cfg.AccrualPollInterval, 2 * time.Second},
+		app.EnvAccrualRequestTimeout: {cfg.AccrualRequestTimeout, 3 * time.Second},
+		app.EnvAccrualLeaseDuration:  {cfg.AccrualLeaseDuration, 17 * time.Second},
+		app.EnvAccrualBackoffBase:    {cfg.AccrualBackoffBase, 4 * time.Second},
+		app.EnvAccrualBackoffCap:     {cfg.AccrualBackoffCap, 9 * time.Minute},
+		app.EnvAccrualRetryAfter:     {cfg.AccrualRetryAfter, 45 * time.Second},
+	}
+
+	for key, test := range tests {
+		if test.got != test.want {
+			t.Errorf("%s: got %s, want %s", key, test.got, test.want)
+		}
+	}
+
+	if cfg.AccrualBatchSize != 7 {
+		t.Errorf("%s: got %d, want 7", app.EnvAccrualBatchSize, cfg.AccrualBatchSize)
+	}
+}
+
+// TestAccrualParametersRejectMalformedValues закрепляет отказ на значениях,
+// которые не разбираются как длительность или число.
+func TestAccrualParametersRejectMalformedValues(t *testing.T) {
+	tests := map[string]string{
+		app.EnvAccrualPollInterval: "быстро",
+		app.EnvAccrualBatchSize:    "много",
+	}
+
+	for key, value := range tests {
+		t.Run(key, func(t *testing.T) {
+			env := requiredEnv()
+			env[key] = value
+
+			if _, err := app.LoadConfig(nil, envOf(env)); err == nil {
+				t.Errorf("значение %q принято как %s", value, key)
+			}
+		})
+	}
+}
+
+// TestAccrualLeaseMustExceedRequestTimeout закрепляет ключевое соотношение:
+// аренда задания обязана переживать обращение к внешней системе, иначе тот же
+// заказ возьмёт другой экземпляр, пока вызов ещё выполняется.
+func TestAccrualLeaseMustExceedRequestTimeout(t *testing.T) {
+	tests := []struct {
+		name    string
+		lease   string
+		timeout string
+		wantErr bool
+	}{
+		{name: "аренда короче обращения", lease: "3s", timeout: "5s", wantErr: true},
+		{name: "аренда равна обращению", lease: "5s", timeout: "5s", wantErr: true},
+		{name: "аренда длиннее обращения", lease: "6s", timeout: "5s", wantErr: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			env := requiredEnv()
+			env[app.EnvAccrualLeaseDuration] = test.lease
+			env[app.EnvAccrualRequestTimeout] = test.timeout
+
+			_, err := app.LoadConfig(nil, envOf(env))
+
+			if test.wantErr && err == nil {
+				t.Error("нарушенное соотношение аренды и таймаута принято")
+			}
+
+			if !test.wantErr && err != nil {
+				t.Errorf("корректное соотношение отвергнуто: %v", err)
+			}
+		})
+	}
+}
+
+// TestAccrualParametersRejectNonPositiveValues закрепляет отказ на
+// неположительных значениях: цикл с нулевым интервалом или нулевой порцией
+// не имеет смысла.
+func TestAccrualParametersRejectNonPositiveValues(t *testing.T) {
+	tests := map[string]string{
+		app.EnvAccrualPollInterval: "0s",
+		app.EnvAccrualBackoffBase:  "-1s",
+		app.EnvAccrualRetryAfter:   "0s",
+		app.EnvAccrualBatchSize:    "0",
+	}
+
+	for key, value := range tests {
+		t.Run(key, func(t *testing.T) {
+			env := requiredEnv()
+			env[key] = value
+
+			if _, err := app.LoadConfig(nil, envOf(env)); err == nil {
+				t.Errorf("неположительное значение %q принято как %s", value, key)
+			}
+		})
+	}
+}
+
+// TestAccrualBackoffCapMustNotBeBelowBase закрепляет осмысленность отсрочки:
+// потолок ниже базы означал бы, что рост отсрочки невозможен.
+func TestAccrualBackoffCapMustNotBeBelowBase(t *testing.T) {
+	env := requiredEnv()
+	env[app.EnvAccrualBackoffBase] = "1m"
+	env[app.EnvAccrualBackoffCap] = "10s"
+
+	if _, err := app.LoadConfig(nil, envOf(env)); err == nil {
+		t.Error("потолок отсрочки ниже её базы принят")
+	}
+}
+
+// TestAccrualSystemAddressHasNoDefault закрепляет, что адрес внешней системы
+// остаётся обязательным параметром запуска и значения по умолчанию не имеет.
+func TestAccrualSystemAddressHasNoDefault(t *testing.T) {
+	env := requiredEnv()
+	delete(env, app.EnvAccrualSystemAddress)
+
+	_, err := app.LoadConfig(nil, envOf(env))
+	if !errors.Is(err, app.ErrMissingConfig) {
+		t.Fatalf("ожидалась ошибка отсутствия обязательного параметра, получено: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), app.EnvAccrualSystemAddress) {
+		t.Errorf("ошибка не называет отсутствующий параметр: %v", err)
 	}
 }
