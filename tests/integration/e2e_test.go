@@ -16,8 +16,54 @@ import (
 	"gophermart/tests/testutil"
 )
 
+// httpResult — ответ сервиса, прочитанный целиком и закрытый.
+//
+// Тестовые хелперы возвращают его вместо *http.Response: тело читается и
+// закрывается там же, где выполнен запрос, поэтому вызывающему коду нечего
+// закрывать и нечего забыть.
+type httpResult struct {
+	// StatusCode — код состояния ответа.
+	StatusCode int
+	// Header — заголовки ответа.
+	Header http.Header
+	// Cookies — cookie ответа, разобранные до закрытия тела.
+	Cookies []*http.Cookie
+	// Body — тело ответа, прочитанное до конца.
+	Body []byte
+}
+
+// doRequest выполняет запрос, считывает ответ целиком и закрывает тело.
+//
+// Тело читается до конца даже тогда, когда вызывающему нужен только код
+// состояния: незавершённое чтение не возвращает соединение в пул, и каждый
+// следующий запрос открывал бы новое.
+func doRequest(t *testing.T, req *http.Request) httpResult {
+	t.Helper()
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("выполнение запроса %s %s: %v", req.Method, req.URL, err)
+	}
+
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("чтение тела ответа %s %s: %v", req.Method, req.URL, err)
+	}
+
+	return httpResult{
+		StatusCode: resp.StatusCode,
+		Header:     resp.Header,
+		Cookies:    resp.Cookies(),
+		Body:       body,
+	}
+}
+
 // doJSONRequest выполняет HTTP-запрос с JSON-телом и заголовком авторизации.
-func doJSONRequest(t *testing.T, method, targetURL, token string, body any) *http.Response {
+func doJSONRequest(t *testing.T, method, targetURL, token string, body any) httpResult {
 	t.Helper()
 
 	var reader io.Reader
@@ -43,20 +89,11 @@ func doJSONRequest(t *testing.T, method, targetURL, token string, body any) *htt
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("выполнение запроса %s %s: %v", method, targetURL, err)
-	}
-
-	t.Cleanup(func() {
-		_ = resp.Body.Close()
-	})
-
-	return resp
+	return doRequest(t, req)
 }
 
 // postTextRequest выполняет HTTP POST-запрос с текстовым телом (text/plain).
-func postTextRequest(t *testing.T, targetURL, token, text string) *http.Response {
+func postTextRequest(t *testing.T, targetURL, token, text string) httpResult {
 	t.Helper()
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, targetURL, strings.NewReader(text))
@@ -70,20 +107,11 @@ func postTextRequest(t *testing.T, targetURL, token, text string) *http.Response
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("выполнение запроса POST %s: %v", targetURL, err)
-	}
-
-	t.Cleanup(func() {
-		_ = resp.Body.Close()
-	})
-
-	return resp
+	return doRequest(t, req)
 }
 
 // extractBearerToken извлекает токен авторизации из заголовка ответа.
-func extractBearerToken(t *testing.T, resp *http.Response) string {
+func extractBearerToken(t *testing.T, resp httpResult) string {
 	t.Helper()
 
 	authHeader := resp.Header.Get("Authorization")
@@ -91,7 +119,7 @@ func extractBearerToken(t *testing.T, resp *http.Response) string {
 		return strings.TrimSpace(token)
 	}
 
-	for _, cookie := range resp.Cookies() {
+	for _, cookie := range resp.Cookies {
 		if cookie.Name == "token" && cookie.Value != "" {
 			return cookie.Value
 		}
@@ -102,18 +130,13 @@ func extractBearerToken(t *testing.T, resp *http.Response) string {
 	return ""
 }
 
-// readJSONBody считывает и разбирает JSON-ответ в произвольную структуру или карту.
-func readJSONBody[T any](t *testing.T, resp *http.Response) T {
+// readJSONBody разбирает прочитанное тело ответа в произвольную структуру или карту.
+func readJSONBody[T any](t *testing.T, body []byte) T {
 	t.Helper()
 
 	var result T
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("чтение тела ответа: %v", err)
-	}
-
-	if err = json.Unmarshal(data, &result); err != nil {
-		t.Fatalf("разбор JSON-ответа (%s): %v", string(data), err)
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("разбор JSON-ответа (%s): %v", string(body), err)
 	}
 
 	return result
@@ -159,7 +182,7 @@ func awaitOrderInState(
 
 		resp := doJSONRequest(t, http.MethodGet, baseURL+"/api/user/orders", token, nil)
 		if resp.StatusCode == http.StatusOK {
-			orders := readJSONBody[[]map[string]any](t, resp)
+			orders := readJSONBody[[]map[string]any](t, resp.Body)
 			if found, ok := checker(orders, orderNumber); ok {
 				return found
 			}
@@ -183,7 +206,7 @@ func awaitUserBalance(t *testing.T, baseURL, token string, current, withdrawn fl
 
 		resp := doJSONRequest(t, http.MethodGet, baseURL+"/api/user/balance", token, nil)
 		if resp.StatusCode == http.StatusOK {
-			b := readJSONBody[map[string]any](t, resp)
+			b := readJSONBody[map[string]any](t, resp.Body)
 			if b["current"] == current && b["withdrawn"] == withdrawn {
 				return
 			}
@@ -271,7 +294,7 @@ func runCheckInitialState(t *testing.T, baseURL, token string) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("получение баланса: got status %d, want 200", resp.StatusCode)
 	}
-	balanceData := readJSONBody[map[string]any](t, resp)
+	balanceData := readJSONBody[map[string]any](t, resp.Body)
 	if balanceData["current"] != float64(0) || balanceData["withdrawn"] != float64(0) {
 		t.Errorf("начальный баланс: got %v, want current=0, withdrawn=0", balanceData)
 	}
@@ -376,7 +399,7 @@ func runWithdrawAndCheckHistory(t *testing.T, baseURL, aliceToken string) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("получение истории списаний: got status %d, want 200", resp.StatusCode)
 	}
-	withdrawalsList := readJSONBody[[]map[string]any](t, resp)
+	withdrawalsList := readJSONBody[[]map[string]any](t, resp.Body)
 	if len(withdrawalsList) != 1 {
 		t.Fatalf("число списаний: got %d, want 1", len(withdrawalsList))
 	}

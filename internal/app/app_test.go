@@ -105,9 +105,12 @@ func TestServeLetsActiveRequestFinish(t *testing.T) {
 	}
 
 	stop := startApp(t, application)
-	responses := make(chan *http.Response, 1)
+	statuses := make(chan int, 1)
 	failures := make(chan error, 1)
 
+	// Тело ответа закрывается в породившей запрос горутине, а наружу уходит
+	// только код состояния: ответ, дошедший до буфера канала после того, как
+	// select ушёл в ветку ошибки или таймаута, иначе не закрыл бы никто.
 	go func() {
 		resp, reqErr := http.Get("http://" + application.Addr() + "/")
 		if reqErr != nil {
@@ -116,7 +119,11 @@ func TestServeLetsActiveRequestFinish(t *testing.T) {
 			return
 		}
 
-		responses <- resp
+		defer func() {
+			_ = resp.Body.Close()
+		}()
+
+		statuses <- resp.StatusCode
 	}()
 
 	<-started
@@ -124,13 +131,9 @@ func TestServeLetsActiveRequestFinish(t *testing.T) {
 	stopErr := stop()
 
 	select {
-	case resp := <-responses:
-		defer func() {
-			_ = resp.Body.Close()
-		}()
-
-		if resp.StatusCode != http.StatusTeapot {
-			t.Errorf("активный запрос не завершился штатно: got %d, want %d", resp.StatusCode, http.StatusTeapot)
+	case status := <-statuses:
+		if status != http.StatusTeapot {
+			t.Errorf("активный запрос не завершился штатно: got %d, want %d", status, http.StatusTeapot)
 		}
 	case reqErr := <-failures:
 		t.Errorf("активный запрос оборван при остановке: %v", reqErr)

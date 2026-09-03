@@ -477,9 +477,12 @@ linters:
       # white-box и живут в самом пакете, а не в postgres_test.
       - path: 'internal/storage/repository/postgres/.+_test\.go'
         linters: [ testpackage ]
+      # bodyclose в этот список намеренно не входит: шаг статического анализа
+      # пайплайна выполняет его как vettool `go vet`, где ни исключения этого
+      # файла, ни директивы nolint не действуют. Исключение здесь означало бы,
+      # что замечания видны только в пайплайне.
       - path: '_test\.go'
         linters:
-          - bodyclose
           - dupl
           - errcheck
           - funlen

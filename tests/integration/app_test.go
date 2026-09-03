@@ -80,7 +80,7 @@ func waitForAddress(t *testing.T, logs *syncBuffer) string {
 }
 
 // get выполняет GET-запрос к сервису.
-func get(t *testing.T, url string) *http.Response {
+func get(t *testing.T, url string) httpResult {
 	t.Helper()
 
 	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
@@ -88,16 +88,7 @@ func get(t *testing.T, url string) *http.Response {
 		t.Fatalf("создание запроса: %v", err)
 	}
 
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatalf("выполнение запроса: %v", err)
-	}
-
-	t.Cleanup(func() {
-		_ = response.Body.Close()
-	})
-
-	return response
+	return doRequest(t, request)
 }
 
 func TestServiceStartsInReviewerConfiguration(t *testing.T) {
@@ -241,7 +232,7 @@ func TestServiceDoesNotLogPasswordDuringAuthScenarios(t *testing.T) {
 }
 
 // postJSON выполняет POST-запрос с телом JSON.
-func postJSON(t *testing.T, url, body string) *http.Response {
+func postJSON(t *testing.T, url, body string) httpResult {
 	t.Helper()
 
 	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, url, strings.NewReader(body))
@@ -251,16 +242,7 @@ func postJSON(t *testing.T, url, body string) *http.Response {
 
 	request.Header.Set("Content-Type", "application/json")
 
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatalf("выполнение запроса: %v", err)
-	}
-
-	t.Cleanup(func() {
-		_ = response.Body.Close()
-	})
-
-	return response
+	return doRequest(t, request)
 }
 
 func TestMainFailsWithoutDatabaseURI(t *testing.T) {

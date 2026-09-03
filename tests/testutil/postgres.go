@@ -1,8 +1,3 @@
-// Package testutil содержит помощники интеграционных тестов: выделение
-// изолированной базы данных PostgreSQL, применение миграций и очистку после
-// теста.
-//
-// Пакет предназначен только для тестов и не используется рабочим кодом.
 package testutil
 
 import (
@@ -25,20 +20,12 @@ import (
 )
 
 // EnvDatabaseURI — переменная окружения со строкой подключения к PostgreSQL,
-// используемой интеграционными тестами.
-//
-// База, на которую указывает строка, служит административной: тесты создают в
-// том же кластере отдельные базы и удаляют их после себя.
 const EnvDatabaseURI = "TEST_DATABASE_URI"
 
 // operationTimeout ограничивает время административных операций с базой.
 const operationTimeout = 30 * time.Second
 
 // RequirePostgres возвращает административную строку подключения из окружения.
-//
-// Если переменная не задана, тест пропускается: интеграционные тесты не должны
-// падать там, где PostgreSQL недоступен, но и не должны молча превращаться в
-// успешные без проверки.
 func RequirePostgres(t *testing.T) string {
 	t.Helper()
 
@@ -51,10 +38,6 @@ func RequirePostgres(t *testing.T) string {
 }
 
 // NewDatabase создаёт пустую базу данных со случайным именем и возвращает
-// строку подключения к ней.
-//
-// База удаляется после завершения теста, поэтому тесты не влияют друг на друга
-// и могут выполняться в произвольном порядке.
 func NewDatabase(t *testing.T) string {
 	t.Helper()
 
@@ -118,11 +101,6 @@ func TableExists(t *testing.T, dsn, table string) bool {
 }
 
 // IndexDefinition возвращает определение индекса схемы public в виде команды
-// CREATE INDEX либо пустую строку, если индекса нет.
-//
-// Проверка по определению, а не по одному лишь имени, нужна тестам схемы:
-// индекс с ожидаемым именем, но другим составом колонок или другим порядком
-// сортировки, не покрывает запрос, ради которого создан.
 func IndexDefinition(t *testing.T, dsn, index string) string {
 	t.Helper()
 
@@ -148,7 +126,6 @@ func IndexDefinition(t *testing.T, dsn, index string) string {
 }
 
 // SchemaVersion возвращает версию схемы и признак повреждения, записанные
-// golang-migrate.
 func SchemaVersion(t *testing.T, dsn string) (int64, bool) {
 	t.Helper()
 
@@ -170,9 +147,6 @@ func SchemaVersion(t *testing.T, dsn string) (int64, bool) {
 }
 
 // execAdmin выполняет административную команду в базе, заданной adminDSN.
-//
-// CREATE DATABASE и DROP DATABASE не выполняются в транзакции, поэтому для них
-// открывается отдельное короткоживущее подключение.
 func execAdmin(t *testing.T, adminDSN, statement string) {
 	t.Helper()
 
@@ -233,17 +207,11 @@ func databaseName(t *testing.T) string {
 }
 
 // quoteIdentifier экранирует идентификатор для подстановки в DDL.
-//
-// Имена баз формируются самим пакетом и не содержат пользовательского ввода,
-// но экранирование остаётся обязательным: DDL не поддерживает параметры.
 func quoteIdentifier(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
 // Rollback откатывает все применённые миграции из fsys на базе dsn.
-//
-// Помощник нужен тестам обратимости схемы: рабочий код применяет миграции
-// только вперёд, поэтому механизма отката в нём нет.
 func Rollback(t *testing.T, dsn string, fsys fs.FS) {
 	t.Helper()
 
