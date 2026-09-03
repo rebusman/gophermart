@@ -16,7 +16,7 @@ import (
 // Значение обновляется вместе с добавлением каждой новой пары файлов
 // миграции: тесты сверяют с ним состояние схемы после применения всех
 // миграций.
-const schemaVersionLatest = 3
+const schemaVersionLatest = 4
 
 func TestMigrationCreatesSchemaTables(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
@@ -292,5 +292,128 @@ func TestMigrationCreatesWithdrawalsHistoryIndex(t *testing.T) {
 	// а история читается по времени списания от новых к старым.
 	if !strings.Contains(definition, "(user_id, processed_at DESC, order_number DESC)") {
 		t.Errorf("неожиданное определение индекса: %s", definition)
+	}
+}
+
+func TestMigrationAddsAccrualSchedulingColumns(t *testing.T) {
+	dsn := testutil.NewDatabase(t)
+
+	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+		t.Fatalf("применение миграций: %v", err)
+	}
+
+	conn := testutil.Connect(t, dsn)
+	userID := uuid.New()
+
+	insertUser := `INSERT INTO users (id, login, password_hash) VALUES ($1, $2, $3)`
+	if _, err := conn.Exec(t.Context(), insertUser, userID, "gopher", "хеш"); err != nil {
+		t.Fatalf("создание пользователя: %v", err)
+	}
+
+	insertOrder := `INSERT INTO orders (number, user_id, status) VALUES ($1, $2, 'NEW')`
+	if _, err := conn.Exec(t.Context(), insertOrder, orderNumberFirst, userID); err != nil {
+		t.Fatalf("создание заказа: %v", err)
+	}
+
+	// Значения по умолчанию делают заказ доступным для проверки немедленно:
+	// отдельного шага заполнения после миграции не требуется.
+	var (
+		attempts int
+		due      bool
+	)
+
+	query := `SELECT attempts, next_attempt_at <= now() FROM orders WHERE number = $1`
+	if err := conn.QueryRow(t.Context(), query, orderNumberFirst).Scan(&attempts, &due); err != nil {
+		t.Fatalf("чтение состояния планировщика: %v", err)
+	}
+
+	if attempts != 0 {
+		t.Errorf("неожиданное число попыток у нового заказа: got %d, want 0", attempts)
+	}
+
+	if !due {
+		t.Error("новый заказ не доступен для проверки немедленно")
+	}
+}
+
+func TestOrdersRejectNegativeAttempts(t *testing.T) {
+	dsn := testutil.NewDatabase(t)
+
+	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+		t.Fatalf("применение миграций: %v", err)
+	}
+
+	conn := testutil.Connect(t, dsn)
+	userID := uuid.New()
+
+	insertUser := `INSERT INTO users (id, login, password_hash) VALUES ($1, $2, $3)`
+	if _, err := conn.Exec(t.Context(), insertUser, userID, "gopher", "хеш"); err != nil {
+		t.Fatalf("создание пользователя: %v", err)
+	}
+
+	insertOrder := `INSERT INTO orders (number, user_id, status, attempts) VALUES ($1, $2, 'NEW', -1)`
+
+	_, err := conn.Exec(t.Context(), insertOrder, orderNumberFirst, userID)
+	if err == nil {
+		t.Fatal("ожидался отказ ограничения неотрицательности числа попыток")
+	}
+
+	if !strings.Contains(err.Error(), "orders_attempts_nonnegative") {
+		t.Errorf("отказ вызван не ограничением неотрицательности: %v", err)
+	}
+}
+
+func TestMigrationCreatesPendingOrdersIndex(t *testing.T) {
+	dsn := testutil.NewDatabase(t)
+
+	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+		t.Fatalf("применение миграций: %v", err)
+	}
+
+	definition := testutil.IndexDefinition(t, dsn, "orders_pending_next_attempt_idx")
+	if definition == "" {
+		t.Fatal("индекс под выборку заданий не создан")
+	}
+
+	// Индекс обязан быть частичным: заказы в окончательных состояниях в
+	// выборку не попадают никогда и со временем составляют большинство строк.
+	if !strings.Contains(definition, "WHERE") || !strings.Contains(definition, "status") {
+		t.Errorf("индекс не является частичным по статусу: %s", definition)
+	}
+
+	if !strings.Contains(definition, "(next_attempt_at)") {
+		t.Errorf("неожиданный состав индекса: %s", definition)
+	}
+}
+
+func TestMigrationDownRemovesSchedulingColumns(t *testing.T) {
+	dsn := testutil.NewDatabase(t)
+
+	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+		t.Fatalf("применение миграций: %v", err)
+	}
+
+	testutil.Rollback(t, dsn, migrations.FS)
+
+	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+		t.Fatalf("повторное применение миграций после отката: %v", err)
+	}
+
+	// Колонка accrual принадлежит миграции 000002 и обратной миграцией 000004
+	// затрагиваться не должна.
+	conn := testutil.Connect(t, dsn)
+
+	query := `SELECT count(*) FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = $1`
+
+	for _, column := range []string{"attempts", "next_attempt_at", "accrual"} {
+		var count int
+		if err := conn.QueryRow(t.Context(), query, column).Scan(&count); err != nil {
+			t.Fatalf("чтение сведений о колонке %s: %v", column, err)
+		}
+
+		if count != 1 {
+			t.Errorf("колонка %s отсутствует после повторного применения миграций", column)
+		}
 	}
 }
