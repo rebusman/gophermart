@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/shopspring/decimal"
 
 	"gophermart/internal/auth"
 	"gophermart/internal/domain"
@@ -41,6 +42,31 @@ func (stubOrderService) Upload(context.Context, domain.OrderNumber, domain.UserI
 
 func (stubOrderService) List(context.Context, domain.UserID) ([]domain.Order, error) {
 	return []domain.Order{}, nil
+}
+
+// stubBalanceService — заглушка сервиса счёта лояльности для тестов
+// аутентификации.
+//
+// Маршруты счёта обязательны при сборке маршрутизатора, но в этих тестах не
+// используются. Заглушка вместо nil-сервиса даёт им отвечать пустым
+// результатом, а не аварийно завершать процесс.
+type stubBalanceService struct{}
+
+func (stubBalanceService) Balance(context.Context, domain.UserID) (domain.Balance, error) {
+	return domain.Balance{}, nil
+}
+
+func (stubBalanceService) Withdraw(
+	context.Context,
+	domain.OrderNumber,
+	decimal.Decimal,
+	domain.UserID,
+) error {
+	return nil
+}
+
+func (stubBalanceService) Withdrawals(context.Context, domain.UserID) ([]domain.Withdrawal, error) {
+	return []domain.Withdrawal{}, nil
 }
 
 // newAuthRouter собирает маршрутизатор с реальным сервисом аутентификации
@@ -82,6 +108,7 @@ func newAuthRouter(t *testing.T) *httptransport.Router {
 		MaxRequestBodyBytes: 1 << 20,
 		Auth:                handlers.NewAuth(authService, authRouterTokenTTL),
 		Orders:              handlers.NewOrders(stubOrderService{}),
+		Balance:             handlers.NewBalance(stubBalanceService{}),
 		Authenticator:       authService,
 	})
 	if err != nil {

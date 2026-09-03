@@ -30,6 +30,18 @@ var (
 	// ErrUnknownOrderStatus возвращается, когда строковое представление
 	ErrUnknownOrderStatus = errors.New("неизвестное состояние расчёта заказа")
 
+	// ErrInsufficientFunds возвращается, когда на счёте лояльности не хватает
+	ErrInsufficientFunds = errors.New("на счёте недостаточно баллов")
+
+	// ErrNonPositiveWithdrawalSum возвращается, когда сумма списания равна
+	ErrNonPositiveWithdrawalSum = errors.New("сумма списания не положительна")
+
+	// ErrWithdrawalSumTooPrecise возвращается, когда сумма списания не
+	ErrWithdrawalSumTooPrecise = errors.New("сумма списания задана точнее допустимого")
+
+	// ErrBalanceNotFound возвращается хранилищем, когда счёта лояльности с
+	ErrBalanceNotFound = errors.New("счёт лояльности не найден")
+
 	// ErrEmptyLogin возвращается, когда логин отсутствует, пуст или состоит
 	ErrEmptyLogin = errors.New("логин не задан")
 

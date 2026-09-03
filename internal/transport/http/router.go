@@ -26,6 +26,8 @@ type RouterConfig struct {
 
 	Orders *handlers.Orders
 
+	Balance *handlers.Balance
+
 	// Authenticator — проверка токена доступа для группы защищённых
 	Authenticator middleware.Authenticator
 }
@@ -54,6 +56,9 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 	protected := mux.With(middleware.Auth(cfg.Authenticator))
 	protected.Post("/api/user/orders", cfg.Orders.Upload)
 	protected.Get("/api/user/orders", cfg.Orders.List)
+	protected.Get("/api/user/balance", cfg.Balance.Get)
+	protected.Post("/api/user/balance/withdraw", cfg.Balance.Withdraw)
+	protected.Get("/api/user/withdrawals", cfg.Balance.Withdrawals)
 
 	var handler http.Handler = mux
 
@@ -84,6 +89,10 @@ func validateRouterConfig(cfg RouterConfig) error {
 
 	if cfg.Orders == nil {
 		errs = append(errs, fmt.Errorf("%w: RouterConfig.Orders", ErrMissingRouterConfig))
+	}
+
+	if cfg.Balance == nil {
+		errs = append(errs, fmt.Errorf("%w: RouterConfig.Balance", ErrMissingRouterConfig))
 	}
 
 	if cfg.Authenticator == nil {

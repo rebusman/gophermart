@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -8,6 +9,27 @@ import (
 	"gophermart/internal/domain"
 	"gophermart/internal/logging"
 )
+
+// writeJSON отправляет клиенту тело ответа в формате JSON с кодом 200.
+func writeJSON(w http.ResponseWriter, r *http.Request, operation string, payload any) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		writeError(w, r, operation, err)
+
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+
+	//nolint:gosec // G705: body — результат json.Marshal с экранированием, отдаётся как application/json с nosniff.
+	if _, err = w.Write(body); err != nil {
+		ctx := r.Context()
+		logging.FromContext(ctx).DebugContext(ctx, "тело ответа не отправлено", logging.ErrorAttr(err))
+	}
+}
 
 // writeStatus отправляет клиенту ответ, состоящий только из кода состояния и
 func writeStatus(w http.ResponseWriter, status int) {
@@ -44,11 +66,15 @@ func statusForError(err error) int {
 		return http.StatusConflict
 	case errors.Is(err, domain.ErrInvalidCredentials), errors.Is(err, domain.ErrUnauthenticated):
 		return http.StatusUnauthorized
+	case errors.Is(err, domain.ErrInsufficientFunds):
+		return http.StatusPaymentRequired
 	case errors.Is(err, domain.ErrInvalidOrderNumber):
 		return http.StatusUnprocessableEntity
 	case errors.Is(err, domain.ErrEmptyLogin),
 		errors.Is(err, domain.ErrEmptyPassword),
-		errors.Is(err, domain.ErrPasswordTooLong):
+		errors.Is(err, domain.ErrPasswordTooLong),
+		errors.Is(err, domain.ErrNonPositiveWithdrawalSum),
+		errors.Is(err, domain.ErrWithdrawalSumTooPrecise):
 		return http.StatusBadRequest
 	default:
 		return http.StatusInternalServerError

@@ -20,6 +20,10 @@ func TestDomainErrorsSurviveWrapping(t *testing.T) {
 		"некорректный номер заказа":  domain.ErrInvalidOrderNumber,
 		"чужой номер заказа":         domain.ErrOrderBelongsToAnotherUser,
 		"неизвестный статус заказа":  domain.ErrUnknownOrderStatus,
+		"недостаток баллов":          domain.ErrInsufficientFunds,
+		"неположительная сумма":      domain.ErrNonPositiveWithdrawalSum,
+		"переточная сумма":           domain.ErrWithdrawalSumTooPrecise,
+		"счёт не найден":             domain.ErrBalanceNotFound,
 	}
 
 	for name, sentinel := range tests {
@@ -45,6 +49,10 @@ func TestDomainErrorsAreDistinguishable(t *testing.T) {
 		domain.ErrInvalidOrderNumber,
 		domain.ErrOrderBelongsToAnotherUser,
 		domain.ErrUnknownOrderStatus,
+		domain.ErrInsufficientFunds,
+		domain.ErrNonPositiveWithdrawalSum,
+		domain.ErrWithdrawalSumTooPrecise,
+		domain.ErrBalanceNotFound,
 	}
 
 	for i, sentinel := range all {

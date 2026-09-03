@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shopspring/decimal"
+
 	"gophermart/internal/domain"
 	httptransport "gophermart/internal/transport/http"
 	"gophermart/internal/transport/http/handlers"
@@ -43,6 +45,25 @@ func (routerOrderService) List(context.Context, domain.UserID) ([]domain.Order, 
 	return []domain.Order{}, nil
 }
 
+type routerBalanceService struct{}
+
+func (routerBalanceService) Balance(context.Context, domain.UserID) (domain.Balance, error) {
+	return domain.Balance{}, nil
+}
+
+func (routerBalanceService) Withdraw(
+	context.Context,
+	domain.OrderNumber,
+	decimal.Decimal,
+	domain.UserID,
+) error {
+	return nil
+}
+
+func (routerBalanceService) Withdrawals(context.Context, domain.UserID) ([]domain.Withdrawal, error) {
+	return []domain.Withdrawal{}, nil
+}
+
 type routerAuthenticator struct{}
 
 func (routerAuthenticator) Authenticate(context.Context, string) (domain.UserID, error) {
@@ -57,6 +78,7 @@ func newRouterConfig(logs *bytes.Buffer) httptransport.RouterConfig {
 		MaxRequestBodyBytes: routerBodyLimit,
 		Auth:                handlers.NewAuth(routerAuthService{}, time.Hour),
 		Orders:              handlers.NewOrders(routerOrderService{}),
+		Balance:             handlers.NewBalance(routerBalanceService{}),
 		Authenticator:       routerAuthenticator{},
 	}
 }
@@ -107,6 +129,7 @@ func TestNewRouterRejectsMissingConfig(t *testing.T) {
 	config := newRouterConfig(&bytes.Buffer{})
 	config.Auth = nil
 	config.Orders = nil
+	config.Balance = nil
 
 	router, err := httptransport.NewRouter(config)
 	if router != nil {
@@ -124,8 +147,8 @@ func TestNewRouterRejectsMissingConfig(t *testing.T) {
 		t.Fatalf("ошибка не объединяет проблемы отдельных полей: %v", err)
 	}
 
-	if got := len(joined.Unwrap()); got != 2 {
-		t.Errorf("сообщено проблем: %d, ожидалось 2: %v", got, err)
+	if got := len(joined.Unwrap()); got != 3 {
+		t.Errorf("сообщено проблем: %d, ожидалось 3: %v", got, err)
 	}
 }
 
@@ -337,6 +360,77 @@ func TestRouterProtectsOrderRoutes(t *testing.T) {
 		t.Run(test.method+" "+test.path, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			router.ServeHTTP(recorder, httptest.NewRequest(test.method, test.path, strings.NewReader("9278923470")))
+
+			if recorder.Code != test.status {
+				t.Errorf("неожиданный код ответа: got %d, want %d", recorder.Code, test.status)
+			}
+		})
+	}
+}
+
+// TestRouterProtectsBalanceRoutes закрепляет сценарий «Запрос без токена»
+// требования «Доступ к счёту только аутентифицированному пользователю»: все
+// три маршрута счёта зарегистрированы в группе защищённых, неизвестный путь
+// по-прежнему даёт 404, а известный путь с неподдерживаемым методом — 405.
+func TestRouterProtectsBalanceRoutes(t *testing.T) {
+	router, _ := newRouter(t)
+
+	tests := []struct {
+		method string
+		path   string
+		status int
+	}{
+		{method: http.MethodGet, path: "/api/user/balance", status: http.StatusUnauthorized},
+		{method: http.MethodPost, path: "/api/user/balance/withdraw", status: http.StatusUnauthorized},
+		{method: http.MethodGet, path: "/api/user/withdrawals", status: http.StatusUnauthorized},
+		{method: http.MethodGet, path: "/api/user/balance/withdrawals", status: http.StatusNotFound},
+		{method: http.MethodPost, path: "/api/user/withdrawals", status: http.StatusMethodNotAllowed},
+		{method: http.MethodDelete, path: "/api/user/balance", status: http.StatusMethodNotAllowed},
+	}
+
+	for _, test := range tests {
+		t.Run(test.method+" "+test.path, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(test.method, test.path, strings.NewReader("{}")))
+
+			if recorder.Code != test.status {
+				t.Errorf("неожиданный код ответа: got %d, want %d", recorder.Code, test.status)
+			}
+		})
+	}
+}
+
+// TestRouterServesBalanceRoutesWithToken закрепляет, что при действительном
+// токене каждый маршрут счёта доходит до своего обработчика.
+func TestRouterServesBalanceRoutesWithToken(t *testing.T) {
+	router, _ := newRouter(t)
+
+	tests := []struct {
+		method string
+		path   string
+		body   string
+		status int
+	}{
+		{method: http.MethodGet, path: "/api/user/balance", status: http.StatusOK},
+		{
+			method: http.MethodPost,
+			path:   "/api/user/balance/withdraw",
+			body:   `{"order":"9278923470","sum":1}`,
+			status: http.StatusOK,
+		},
+		// Подставной сервис возвращает пустую историю, поэтому маршрут
+		// отвечает 204: значение кода подтверждает, что вызван именно
+		// обработчик истории списаний.
+		{method: http.MethodGet, path: "/api/user/withdrawals", status: http.StatusNoContent},
+	}
+
+	for _, test := range tests {
+		t.Run(test.method+" "+test.path, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, test.path, strings.NewReader(test.body))
+			request.Header.Set(middleware.HeaderAuthorization, middleware.BearerScheme+" тестовый-токен")
+
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
 
 			if recorder.Code != test.status {
 				t.Errorf("неожиданный код ответа: got %d, want %d", recorder.Code, test.status)

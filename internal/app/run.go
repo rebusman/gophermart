@@ -83,12 +83,14 @@ func newRouter(cfg Config, logger *slog.Logger, pool *pgxpool.Pool) (*httptransp
 
 	authService := service.NewAuth(postgres.NewUserRepository(pool), hasher, tokens)
 	orderService := service.NewOrders(postgres.NewOrderRepository(pool))
+	balanceService := service.NewBalances(postgres.NewBalanceRepository(pool))
 
 	return httptransport.NewRouter(httptransport.RouterConfig{
 		Logger:              logger,
 		MaxRequestBodyBytes: cfg.MaxRequestBodyBytes,
 		Auth:                handlers.NewAuth(authService, cfg.TokenTTL),
 		Orders:              handlers.NewOrders(orderService),
+		Balance:             handlers.NewBalance(balanceService),
 		Authenticator:       authService,
 	})
 }

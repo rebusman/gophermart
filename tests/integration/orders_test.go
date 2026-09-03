@@ -56,12 +56,14 @@ func newOrdersRouter(t *testing.T) (*httptransport.Router, *pgxpool.Pool) {
 
 	authService := service.NewAuth(postgres.NewUserRepository(pool), hasher, tokens)
 	orderService := service.NewOrders(postgres.NewOrderRepository(pool))
+	balanceService := service.NewBalances(postgres.NewBalanceRepository(pool))
 
 	router, err := httptransport.NewRouter(httptransport.RouterConfig{
 		Logger:              slog.New(slog.DiscardHandler),
 		MaxRequestBodyBytes: 1 << 20,
 		Auth:                handlers.NewAuth(authService, authRouterTokenTTL),
 		Orders:              handlers.NewOrders(orderService),
+		Balance:             handlers.NewBalance(balanceService),
 		Authenticator:       authService,
 	})
 	if err != nil {

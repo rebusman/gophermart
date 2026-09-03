@@ -167,3 +167,59 @@ func (s *orderRepositoryStub) OrdersByUser(_ context.Context, userID domain.User
 
 	return s.orders, nil
 }
+
+// balanceRepositoryStub подменяет хранилище счёта лояльности в юнит-тестах.
+//
+// Счётчики позволяют убедиться, что при неположительной сумме сервис вовсе не
+// обращается к хранилищу, а не полагается на отказ базы данных.
+type balanceRepositoryStub struct {
+	balance    domain.Balance
+	balanceErr error
+
+	created     bool
+	withdrawErr error
+
+	withdrawals []domain.Withdrawal
+	listErr     error
+
+	balanceCalls  int
+	withdrawCalls int
+	withdrawn     []domain.Withdrawal
+	listedFor     domain.UserID
+	balanceFor    domain.UserID
+}
+
+func (s *balanceRepositoryStub) Balance(_ context.Context, userID domain.UserID) (domain.Balance, error) {
+	s.balanceCalls++
+	s.balanceFor = userID
+
+	if s.balanceErr != nil {
+		return domain.Balance{}, s.balanceErr
+	}
+
+	return s.balance, nil
+}
+
+func (s *balanceRepositoryStub) Withdraw(_ context.Context, withdrawal domain.Withdrawal) (bool, error) {
+	s.withdrawCalls++
+	s.withdrawn = append(s.withdrawn, withdrawal)
+
+	if s.withdrawErr != nil {
+		return false, s.withdrawErr
+	}
+
+	return s.created, nil
+}
+
+func (s *balanceRepositoryStub) WithdrawalsByUser(
+	_ context.Context,
+	userID domain.UserID,
+) ([]domain.Withdrawal, error) {
+	s.listedFor = userID
+
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+
+	return s.withdrawals, nil
+}

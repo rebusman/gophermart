@@ -2,11 +2,9 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"gophermart/internal/domain"
@@ -97,23 +95,7 @@ func (h *Orders) List(w http.ResponseWriter, r *http.Request) {
 		payload = append(payload, newOrderDTO(order))
 	}
 
-	body, err := json.Marshal(payload)
-	if err != nil {
-		writeError(w, r, "сериализация списка заказов", err)
-
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.WriteHeader(http.StatusOK)
-
-	//nolint:gosec // G705: body — результат json.Marshal с экранированием, отдаётся как application/json с nosniff.
-	if _, err = w.Write(body); err != nil {
-		ctx := r.Context()
-		logging.FromContext(ctx).DebugContext(ctx, "тело ответа не отправлено", logging.ErrorAttr(err))
-	}
+	writeJSON(w, r, "сериализация списка заказов", payload)
 }
 
 // newOrderDTO переводит доменный заказ в представление ответа.
@@ -132,7 +114,7 @@ func userIDFromRequest(w http.ResponseWriter, r *http.Request) (domain.UserID, b
 	if !ok {
 		ctx := r.Context()
 		logging.FromContext(ctx).ErrorContext(ctx,
-			"маршрут заказов вызван без проверки токена доступа")
+			"защищённый маршрут вызван без проверки токена доступа")
 		writeStatus(w, http.StatusInternalServerError)
 
 		return domain.UserID{}, false
