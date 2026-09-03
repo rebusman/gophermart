@@ -100,6 +100,31 @@ func TableExists(t *testing.T, dsn, table string) bool {
 	return exists
 }
 
+// IndexDefinition возвращает определение индекса схемы public в виде команды
+func IndexDefinition(t *testing.T, dsn, index string) string {
+	t.Helper()
+
+	conn := Connect(t, dsn)
+
+	ctx, cancel := context.WithTimeout(t.Context(), operationTimeout)
+	defer cancel()
+
+	var definition string
+
+	query := `SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1`
+
+	err := conn.QueryRow(ctx, query, index).Scan(&definition)
+
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return ""
+	case err != nil:
+		t.Fatalf("чтение определения индекса %s: %v", index, err)
+	}
+
+	return definition
+}
+
 // SchemaVersion возвращает версию схемы и признак повреждения, записанные
 func SchemaVersion(t *testing.T, dsn string) (int64, bool) {
 	t.Helper()

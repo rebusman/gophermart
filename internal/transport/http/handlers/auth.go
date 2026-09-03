@@ -3,11 +3,9 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"time"
 
-	"gophermart/internal/domain"
 	"gophermart/internal/logging"
 	"gophermart/internal/transport/http/dto"
 	"gophermart/internal/transport/http/middleware"
@@ -42,7 +40,7 @@ func (h *Auth) Register(w http.ResponseWriter, r *http.Request) {
 
 	token, err := h.service.Register(r.Context(), credentials.Login, credentials.Password)
 	if err != nil {
-		writeAuthError(w, r, "регистрация пользователя", err)
+		writeError(w, r, "регистрация пользователя", err)
 
 		return
 	}
@@ -59,7 +57,7 @@ func (h *Auth) Login(w http.ResponseWriter, r *http.Request) {
 
 	token, err := h.service.Login(r.Context(), credentials.Login, credentials.Password)
 	if err != nil {
-		writeAuthError(w, r, "аутентификация пользователя", err)
+		writeError(w, r, "аутентификация пользователя", err)
 
 		return
 	}
@@ -103,35 +101,4 @@ func decodeCredentials(w http.ResponseWriter, r *http.Request) (dto.Credentials,
 	}
 
 	return credentials, true
-}
-
-// writeAuthError отображает ошибку прикладного сценария в код ответа.
-func writeAuthError(w http.ResponseWriter, r *http.Request, operation string, err error) {
-	status := statusForError(err)
-	ctx := r.Context()
-	logger := logging.FromContext(ctx)
-
-	if status == http.StatusInternalServerError {
-		logger.ErrorContext(ctx, operation+" не выполнена", logging.ErrorAttr(err))
-	} else {
-		logger.DebugContext(ctx, operation+" отклонена", logging.ErrorAttr(err))
-	}
-
-	writeStatus(w, status)
-}
-
-// statusForError сопоставляет доменной ошибке код ответа.
-func statusForError(err error) int {
-	switch {
-	case errors.Is(err, domain.ErrLoginTaken):
-		return http.StatusConflict
-	case errors.Is(err, domain.ErrInvalidCredentials), errors.Is(err, domain.ErrUnauthenticated):
-		return http.StatusUnauthorized
-	case errors.Is(err, domain.ErrEmptyLogin),
-		errors.Is(err, domain.ErrEmptyPassword),
-		errors.Is(err, domain.ErrPasswordTooLong):
-		return http.StatusBadRequest
-	default:
-		return http.StatusInternalServerError
-	}
 }

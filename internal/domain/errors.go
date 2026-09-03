@@ -18,6 +18,18 @@ var (
 	// ErrInvalidUserID возвращается, когда строковое представление
 	ErrInvalidUserID = errors.New("некорректный идентификатор пользователя")
 
+	// ErrOrderNotFound возвращается хранилищем, когда заказа с указанным
+	ErrOrderNotFound = errors.New("заказ не найден")
+
+	// ErrInvalidOrderNumber возвращается, когда значение не является номером
+	ErrInvalidOrderNumber = errors.New("некорректный номер заказа")
+
+	// ErrOrderBelongsToAnotherUser возвращается, когда номер заказа уже
+	ErrOrderBelongsToAnotherUser = errors.New("номер заказа принадлежит другому пользователю")
+
+	// ErrUnknownOrderStatus возвращается, когда строковое представление
+	ErrUnknownOrderStatus = errors.New("неизвестное состояние расчёта заказа")
+
 	// ErrEmptyLogin возвращается, когда логин отсутствует, пуст или состоит
 	ErrEmptyLogin = errors.New("логин не задан")
 

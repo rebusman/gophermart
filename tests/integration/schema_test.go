@@ -11,23 +11,27 @@ import (
 	"gophermart/tests/testutil"
 )
 
-// schemaVersionUsersBalances — версия миграции, создающей users и balances.
-const schemaVersionUsersBalances = 1
+// schemaVersionLatest — версия последней миграции схемы.
+//
+// Значение обновляется вместе с добавлением каждой новой пары файлов
+// миграции: тесты сверяют с ним состояние схемы после применения всех
+// миграций.
+const schemaVersionLatest = 2
 
-func TestMigrationCreatesUsersAndBalances(t *testing.T) {
+func TestMigrationCreatesSchemaTables(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
 	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("применение миграций: %v", err)
 	}
 
-	for _, table := range []string{"users", "balances"} {
+	for _, table := range []string{"users", "balances", "orders"} {
 		if !testutil.TableExists(t, dsn, table) {
 			t.Errorf("таблица %s не создана", table)
 		}
 	}
 
-	if version, dirty := testutil.SchemaVersion(t, dsn); version != schemaVersionUsersBalances || dirty {
+	if version, dirty := testutil.SchemaVersion(t, dsn); version != schemaVersionLatest || dirty {
 		t.Errorf("неожиданное состояние схемы: версия %d, повреждена %t", version, dirty)
 	}
 }
@@ -43,7 +47,7 @@ func TestMigrationIsIdempotentOnActualSchema(t *testing.T) {
 		t.Fatalf("повторное применение миграций: %v", err)
 	}
 
-	if version, dirty := testutil.SchemaVersion(t, dsn); version != schemaVersionUsersBalances || dirty {
+	if version, dirty := testutil.SchemaVersion(t, dsn); version != schemaVersionLatest || dirty {
 		t.Errorf("повторный запуск изменил схему: версия %d, повреждена %t", version, dirty)
 	}
 }
@@ -57,7 +61,7 @@ func TestMigrationIsReversible(t *testing.T) {
 
 	testutil.Rollback(t, dsn, migrations.FS)
 
-	for _, table := range []string{"users", "balances"} {
+	for _, table := range []string{"users", "balances", "orders"} {
 		if testutil.TableExists(t, dsn, table) {
 			t.Errorf("таблица %s не удалена обратной миграцией", table)
 		}
@@ -67,7 +71,7 @@ func TestMigrationIsReversible(t *testing.T) {
 		t.Fatalf("повторное применение миграций после отката: %v", err)
 	}
 
-	for _, table := range []string{"users", "balances"} {
+	for _, table := range []string{"users", "balances", "orders"} {
 		if !testutil.TableExists(t, dsn, table) {
 			t.Errorf("таблица %s не создана после повторного применения", table)
 		}
@@ -140,5 +144,58 @@ func TestUsersRejectDuplicateAndEmptyLogin(t *testing.T) {
 		t.Error("пустой логин принят, ограничение непустоты не сработало")
 	} else if !strings.Contains(err.Error(), "users_login_not_empty") {
 		t.Errorf("отказ вызван не ограничением непустоты логина: %v", err)
+	}
+}
+
+func TestMigrationCreatesOrdersListIndex(t *testing.T) {
+	dsn := testutil.NewDatabase(t)
+
+	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+		t.Fatalf("применение миграций: %v", err)
+	}
+
+	definition := testutil.IndexDefinition(t, dsn, "orders_user_uploaded_at_idx")
+	if definition == "" {
+		t.Fatal("индекс под выдачу списка заказов не создан")
+	}
+
+	// Состав и порядок сортировки существенны: индекс должен покрывать
+	// ORDER BY uploaded_at DESC, number DESC внутри одного пользователя
+	// целиком, иначе группы строк с совпадающим временем досортировываются.
+	if !strings.Contains(definition, "(user_id, uploaded_at DESC, number DESC)") {
+		t.Errorf("неожиданное определение индекса: %s", definition)
+	}
+}
+
+func TestOrdersRejectUnknownStatus(t *testing.T) {
+	dsn := testutil.NewDatabase(t)
+
+	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+		t.Fatalf("применение миграций: %v", err)
+	}
+
+	conn := testutil.Connect(t, dsn)
+	userID := uuid.New()
+
+	insertUser := `INSERT INTO users (id, login, password_hash) VALUES ($1, $2, $3)`
+	if _, err := conn.Exec(t.Context(), insertUser, userID, "gopher", "хеш"); err != nil {
+		t.Fatalf("создание пользователя: %v", err)
+	}
+
+	insertOrder := `INSERT INTO orders (number, user_id, status) VALUES ($1, $2, $3)`
+
+	for _, status := range []string{"NEW", "PROCESSING", "INVALID", "PROCESSED"} {
+		if _, err := conn.Exec(t.Context(), insertOrder, "номер-"+status, userID, status); err != nil {
+			t.Errorf("статус %s отвергнут базой: %v", status, err)
+		}
+	}
+
+	_, err := conn.Exec(t.Context(), insertOrder, "12345678903", userID, "UNKNOWN")
+	if err == nil {
+		t.Fatal("ожидался отказ ограничения словаря статусов")
+	}
+
+	if !strings.Contains(err.Error(), "orders_status_known") {
+		t.Errorf("отказ вызван не ограничением словаря статусов: %v", err)
 	}
 }

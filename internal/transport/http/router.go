@@ -19,6 +19,8 @@ type RouterConfig struct {
 
 	Auth *handlers.Auth
 
+	Orders *handlers.Orders
+
 	// Authenticator — проверка токена доступа для группы защищённых
 	Authenticator middleware.Authenticator
 }
@@ -40,6 +42,10 @@ func NewRouter(cfg RouterConfig) *Router {
 	mux.Post("/api/user/register", cfg.Auth.Register)
 	mux.Post("/api/user/login", cfg.Auth.Login)
 
+	protected := mux.With(middleware.Auth(cfg.Authenticator))
+	protected.Post("/api/user/orders", cfg.Orders.Upload)
+	protected.Get("/api/user/orders", cfg.Orders.List)
+
 	var handler http.Handler = mux
 
 	handler = middleware.BodyLimit(cfg.MaxRequestBodyBytes)(handler)
@@ -51,7 +57,7 @@ func NewRouter(cfg RouterConfig) *Router {
 	return &Router{
 		Router:    mux,
 		handler:   handler,
-		protected: mux.With(middleware.Auth(cfg.Authenticator)),
+		protected: protected,
 	}
 }
 

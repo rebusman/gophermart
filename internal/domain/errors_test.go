@@ -17,6 +17,9 @@ func TestDomainErrorsSurviveWrapping(t *testing.T) {
 		"пустой логин":               domain.ErrEmptyLogin,
 		"пустой пароль":              domain.ErrEmptyPassword,
 		"слишком длинный пароль":     domain.ErrPasswordTooLong,
+		"некорректный номер заказа":  domain.ErrInvalidOrderNumber,
+		"чужой номер заказа":         domain.ErrOrderBelongsToAnotherUser,
+		"неизвестный статус заказа":  domain.ErrUnknownOrderStatus,
 	}
 
 	for name, sentinel := range tests {
@@ -39,6 +42,9 @@ func TestDomainErrorsAreDistinguishable(t *testing.T) {
 		domain.ErrEmptyLogin,
 		domain.ErrEmptyPassword,
 		domain.ErrPasswordTooLong,
+		domain.ErrInvalidOrderNumber,
+		domain.ErrOrderBelongsToAnotherUser,
+		domain.ErrUnknownOrderStatus,
 	}
 
 	for i, sentinel := range all {

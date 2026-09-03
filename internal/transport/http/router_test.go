@@ -19,7 +19,11 @@ import (
 const routerBodyLimit = 32
 
 // newRouter собирает маршрутизатор с логгером, пишущим в возвращаемый буфер, и
-// одним зарегистрированным маршрутом, отвечающим кодом 200.
+// одним зарегистрированным публичным маршрутом, отвечающим кодом 200.
+//
+// Путь тестового маршрута не совпадает с путями сервиса: маршруты заказов
+// регистрирует сам конструктор, и повторная регистрация того же пути подменила
+// бы проверяемый обработчик.
 func newRouter(t *testing.T) (*httptransport.Router, *bytes.Buffer) {
 	t.Helper()
 
@@ -30,7 +34,7 @@ func newRouter(t *testing.T) (*httptransport.Router, *bytes.Buffer) {
 		MaxRequestBodyBytes: routerBodyLimit,
 	})
 
-	router.Post("/api/user/orders", func(w http.ResponseWriter, _ *http.Request) {
+	router.Post("/api/user/тестовый-маршрут", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "принято")
 	})
 
@@ -82,7 +86,8 @@ func TestRouterServesRegisteredRoute(t *testing.T) {
 	router, _ := newRouter(t)
 
 	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/user/orders", strings.NewReader("1")))
+	router.ServeHTTP(recorder,
+		httptest.NewRequest(http.MethodPost, "/api/user/тестовый-маршрут", strings.NewReader("1")))
 
 	if recorder.Code != http.StatusOK {
 		t.Errorf("неожиданный код ответа: got %d, want %d", recorder.Code, http.StatusOK)
@@ -212,5 +217,34 @@ func TestRouterAppliesMiddlewareWithoutRegisteredRoutes(t *testing.T) {
 
 	if logs.Len() == 0 {
 		t.Error("обработчик журналирования не выполнился")
+	}
+}
+
+// TestRouterProtectsOrderRoutes закрепляет сценарий «Запрос без токена»
+// требования «Доступ к заказам только аутентифицированному пользователю»: оба
+// маршрута заказов зарегистрированы в группе защищённых, а неизвестный путь
+// по-прежнему даёт 404.
+func TestRouterProtectsOrderRoutes(t *testing.T) {
+	router, _ := newRouter(t)
+
+	tests := []struct {
+		method string
+		path   string
+		status int
+	}{
+		{method: http.MethodPost, path: "/api/user/orders", status: http.StatusUnauthorized},
+		{method: http.MethodGet, path: "/api/user/orders", status: http.StatusUnauthorized},
+		{method: http.MethodGet, path: "/api/user/orders/9278923470", status: http.StatusNotFound},
+	}
+
+	for _, test := range tests {
+		t.Run(test.method+" "+test.path, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(test.method, test.path, strings.NewReader("9278923470")))
+
+			if recorder.Code != test.status {
+				t.Errorf("неожиданный код ответа: got %d, want %d", recorder.Code, test.status)
+			}
+		})
 	}
 }

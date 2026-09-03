@@ -117,3 +117,53 @@ func (s *tokenIssuerStub) Parse(token string) (domain.UserID, error) {
 
 	return s.parse(token)
 }
+
+// orderRepositoryStub подменяет хранилище заказов в юнит-тестах.
+//
+// Поля описывают исход каждого обращения, а счётчики позволяют убедиться, что
+// владелец занятого номера выясняется ровно тогда, когда вставка сообщила о
+// конфликте, и ни разу больше.
+type orderRepositoryStub struct {
+	created   bool
+	createErr error
+
+	owner    domain.UserID
+	ownerErr error
+
+	orders  []domain.Order
+	listErr error
+
+	createdOrders []domain.Order
+	ownerCalls    int
+	listedUser    domain.UserID
+}
+
+func (s *orderRepositoryStub) CreateOrder(_ context.Context, order domain.Order) (bool, error) {
+	s.createdOrders = append(s.createdOrders, order)
+
+	if s.createErr != nil {
+		return false, s.createErr
+	}
+
+	return s.created, nil
+}
+
+func (s *orderRepositoryStub) OrderOwner(_ context.Context, _ domain.OrderNumber) (domain.UserID, error) {
+	s.ownerCalls++
+
+	if s.ownerErr != nil {
+		return domain.UserID{}, s.ownerErr
+	}
+
+	return s.owner, nil
+}
+
+func (s *orderRepositoryStub) OrdersByUser(_ context.Context, userID domain.UserID) ([]domain.Order, error) {
+	s.listedUser = userID
+
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+
+	return s.orders, nil
+}
