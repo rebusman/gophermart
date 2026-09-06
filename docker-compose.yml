@@ -1,0 +1,42 @@
+# Сервис приложения здесь намеренно отсутствует: сервис запускается локально
+# через `make run`, который задаёт фиксированный JWT_SECRET для разработки.
+# Compose поднимает только его внешние зависимости.
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: gophermart-postgres
+    environment:
+      POSTGRES_USER: gophermart
+      POSTGRES_PASSWORD: gophermart
+      POSTGRES_DB: gophermart
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gophermart -d gophermart"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # Применение и откат миграций вручную. Сервис применяет их сам при старте,
+  # поэтому эти команды нужны только для отладки схемы.
+  #
+  #   docker compose run --rm migrate up
+  #   docker compose run --rm migrate down 1
+  migrate:
+    image: migrate/migrate:v4.19.1
+    profiles: ["tools"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/migrations:ro
+    entrypoint:
+      - migrate
+      - -path=/migrations
+      - -database=postgres://gophermart:gophermart@postgres:5432/gophermart?sslmode=disable
+
+volumes:
+  postgres-data:
