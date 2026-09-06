@@ -7,11 +7,15 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"sync"
 	"time"
 
 	"gophermart/internal/logging"
 )
+
+// ErrBackgroundTaskPanic сообщает, что фоновая задача завершилась паникой.
+var ErrBackgroundTaskPanic = errors.New("фоновая задача завершилась аварийно")
 
 // BackgroundTask описывает фоновую задачу, живущую столько же, сколько сервис.
 type BackgroundTask struct {
@@ -127,6 +131,22 @@ func (a *App) startTasks(ctx context.Context) <-chan error {
 
 	for i, task := range a.tasks {
 		wg.Go(func() {
+			defer func() {
+				recovered := recover()
+				if recovered == nil {
+					return
+				}
+
+				a.logger.ErrorContext(ctx, "panic в фоновой задаче",
+					slog.Any("panic", recovered),
+					slog.String("stack", string(debug.Stack())),
+					slog.String("task", task.Name),
+				)
+
+				errs[i] = fmt.Errorf("%w: фоновая задача %s: %v",
+					ErrBackgroundTaskPanic, task.Name, recovered)
+			}()
+
 			a.logger.InfoContext(ctx, "фоновая задача запущена", slog.String("task", task.Name))
 
 			if err := task.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {

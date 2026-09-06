@@ -38,7 +38,7 @@ func newOrderRepository(t *testing.T) (*postgres.OrderRepository, *postgres.User
 
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("применение миграций: %v", err)
 	}
 

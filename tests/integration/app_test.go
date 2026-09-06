@@ -3,6 +3,7 @@ package integration_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -117,8 +118,12 @@ func TestServiceStartsInReviewerConfiguration(t *testing.T) {
 		t.Errorf("нет предупреждения о сгенерированном секрете подписи: %s", output)
 	}
 
-	if !strings.Contains(output, "схема базы данных актуальна") {
-		t.Errorf("миграции не применялись при старте: %s", output)
+	// Версия проверяется вместе с сообщением: сообщение само по себе не
+	// отличает старт на применённых миграциях от старта, при котором миграции
+	// не применялись.
+	schemaRecord := fmt.Sprintf(`"msg":"схема базы данных актуальна","version":%d`, schemaVersionLatest)
+	if !strings.Contains(output, schemaRecord) {
+		t.Errorf("запись о схеме не называет версию %d: %s", schemaVersionLatest, output)
 	}
 
 	if !strings.Contains(output, "сервис остановлен") {

@@ -45,11 +45,12 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 
 	defer pool.Close()
 
-	if err = postgres.Migrate(ctx, cfg.DatabaseURI, migrations.FS); err != nil {
+	schemaVersion, err := postgres.Migrate(ctx, cfg.DatabaseURI, migrations.FS)
+	if err != nil {
 		return fmt.Errorf("применение миграций: %w", err)
 	}
 
-	logger.InfoContext(ctx, "схема базы данных актуальна")
+	logger.InfoContext(ctx, "схема базы данных актуальна", slog.Uint64("version", uint64(schemaVersion)))
 
 	router, err := newRouter(cfg, logger, pool)
 	if err != nil {

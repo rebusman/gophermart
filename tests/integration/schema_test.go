@@ -21,8 +21,13 @@ const schemaVersionLatest = 4
 func TestMigrationCreatesSchemaTables(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	applied, err := postgres.Migrate(t.Context(), dsn, migrations.FS)
+	if err != nil {
 		t.Fatalf("применение миграций: %v", err)
+	}
+
+	if applied != schemaVersionLatest {
+		t.Errorf("возвращённая версия схемы: got %d, want %d", applied, schemaVersionLatest)
 	}
 
 	for _, table := range []string{"users", "balances", "orders", "withdrawals"} {
@@ -39,11 +44,11 @@ func TestMigrationCreatesSchemaTables(t *testing.T) {
 func TestMigrationIsIdempotentOnActualSchema(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("первое применение миграций: %v", err)
 	}
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("повторное применение миграций: %v", err)
 	}
 
@@ -55,7 +60,7 @@ func TestMigrationIsIdempotentOnActualSchema(t *testing.T) {
 func TestMigrationIsReversible(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("первое применение миграций: %v", err)
 	}
 
@@ -67,7 +72,7 @@ func TestMigrationIsReversible(t *testing.T) {
 		}
 	}
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("повторное применение миграций после отката: %v", err)
 	}
 
@@ -81,7 +86,7 @@ func TestMigrationIsReversible(t *testing.T) {
 func TestBalancesRejectNegativeAmounts(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("применение миграций: %v", err)
 	}
 
@@ -121,7 +126,7 @@ func TestBalancesRejectNegativeAmounts(t *testing.T) {
 func TestUsersRejectDuplicateAndEmptyLogin(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("применение миграций: %v", err)
 	}
 
@@ -150,7 +155,7 @@ func TestUsersRejectDuplicateAndEmptyLogin(t *testing.T) {
 func TestMigrationCreatesOrdersListIndex(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("применение миграций: %v", err)
 	}
 
@@ -170,7 +175,7 @@ func TestMigrationCreatesOrdersListIndex(t *testing.T) {
 func TestOrdersRejectUnknownStatus(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("применение миграций: %v", err)
 	}
 
@@ -203,7 +208,7 @@ func TestOrdersRejectUnknownStatus(t *testing.T) {
 func TestWithdrawalsUniquePerUserAndOrder(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("применение миграций: %v", err)
 	}
 
@@ -240,7 +245,7 @@ func TestWithdrawalsUniquePerUserAndOrder(t *testing.T) {
 func TestWithdrawalsRejectNonPositiveSum(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("применение миграций: %v", err)
 	}
 
@@ -279,7 +284,7 @@ func TestWithdrawalsRejectNonPositiveSum(t *testing.T) {
 func TestMigrationCreatesWithdrawalsHistoryIndex(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("применение миграций: %v", err)
 	}
 
@@ -298,7 +303,7 @@ func TestMigrationCreatesWithdrawalsHistoryIndex(t *testing.T) {
 func TestMigrationAddsAccrualSchedulingColumns(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("применение миграций: %v", err)
 	}
 
@@ -339,7 +344,7 @@ func TestMigrationAddsAccrualSchedulingColumns(t *testing.T) {
 func TestOrdersRejectNegativeAttempts(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("применение миграций: %v", err)
 	}
 
@@ -366,7 +371,7 @@ func TestOrdersRejectNegativeAttempts(t *testing.T) {
 func TestMigrationCreatesPendingOrdersIndex(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("применение миграций: %v", err)
 	}
 
@@ -389,13 +394,13 @@ func TestMigrationCreatesPendingOrdersIndex(t *testing.T) {
 func TestMigrationDownRemovesSchedulingColumns(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("применение миграций: %v", err)
 	}
 
 	testutil.Rollback(t, dsn, migrations.FS)
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("повторное применение миграций после отката: %v", err)
 	}
 

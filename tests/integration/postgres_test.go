@@ -77,7 +77,7 @@ func TestPoolFailsOnMalformedDSN(t *testing.T) {
 func TestMigrateAppliesMigrationsToEmptyDatabase(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, fixtureV1V2()); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, fixtureV1V2()); err != nil {
 		t.Fatalf("применение миграций: %v", err)
 	}
 
@@ -95,11 +95,11 @@ func TestMigrateAppliesMigrationsToEmptyDatabase(t *testing.T) {
 func TestMigrateIsIdempotent(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, fixtureV1V2()); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, fixtureV1V2()); err != nil {
 		t.Fatalf("первое применение миграций: %v", err)
 	}
 
-	if err := postgres.Migrate(t.Context(), dsn, fixtureV1V2()); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, fixtureV1V2()); err != nil {
 		t.Fatalf("повторное применение миграций: %v", err)
 	}
 
@@ -111,7 +111,7 @@ func TestMigrateIsIdempotent(t *testing.T) {
 func TestMigrateAppliesOnlyMissingMigrations(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, fixtureV1()); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, fixtureV1()); err != nil {
 		t.Fatalf("применение первой версии: %v", err)
 	}
 
@@ -119,7 +119,7 @@ func TestMigrateAppliesOnlyMissingMigrations(t *testing.T) {
 		t.Fatal("вторая миграция применена преждевременно")
 	}
 
-	if err := postgres.Migrate(t.Context(), dsn, fixtureV1V2()); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, fixtureV1V2()); err != nil {
 		t.Fatalf("применение недостающих миграций: %v", err)
 	}
 
@@ -135,7 +135,7 @@ func TestMigrateAppliesOnlyMissingMigrations(t *testing.T) {
 func TestMigrateFailsAndMarksSchemaDirty(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, fixtureBroken()); err == nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, fixtureBroken()); err == nil {
 		t.Fatal("ожидалась ошибка применения неприменимой миграции")
 	}
 
@@ -147,21 +147,22 @@ func TestMigrateFailsAndMarksSchemaDirty(t *testing.T) {
 func TestMigrateRefusesDirtySchema(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, fixtureBroken()); err == nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, fixtureBroken()); err == nil {
 		t.Fatal("ожидалась ошибка применения неприменимой миграции")
 	}
 
-	err := postgres.Migrate(t.Context(), dsn, fixtureV1())
+	_, err := postgres.Migrate(t.Context(), dsn, fixtureV1())
 	if !errors.Is(err, postgres.ErrDirtySchema) {
 		t.Errorf("повреждённая схема не распознана: %v", err)
 	}
 }
 
-func TestMigrateSucceedsWithoutMigrations(t *testing.T) {
+func TestMigrateFailsWithoutMigrations(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, fstest.MapFS{}); err != nil {
-		t.Fatalf("пустой набор миграций должен применяться успешно: %v", err)
+	_, err := postgres.Migrate(t.Context(), dsn, fstest.MapFS{})
+	if !errors.Is(err, postgres.ErrNoMigrations) {
+		t.Fatalf("пустой набор миграций должен быть ошибкой: %v", err)
 	}
 
 	if testutil.TableExists(t, dsn, "schema_migrations") {
@@ -172,7 +173,7 @@ func TestMigrateSucceedsWithoutMigrations(t *testing.T) {
 func TestMigrateAppliesEmbeddedMigrations(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("применение встроенных миграций: %v", err)
 	}
 }

@@ -23,7 +23,7 @@ func newUserRepository(t *testing.T) (*postgres.UserRepository, *pgxpool.Pool) {
 
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("применение миграций: %v", err)
 	}
 
@@ -139,7 +139,7 @@ func TestUserRepositoryFindsUserByLoginAndID(t *testing.T) {
 func TestUserRepositoryRollsBackOnBalanceCreationFailure(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("применение миграций: %v", err)
 	}
 

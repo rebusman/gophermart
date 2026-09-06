@@ -32,7 +32,7 @@ func newBalanceRouter(t *testing.T) (*httptransport.Router, *pgxpool.Pool) {
 
 	dsn := testutil.NewDatabase(t)
 
-	if err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
+	if _, err := postgres.Migrate(t.Context(), dsn, migrations.FS); err != nil {
 		t.Fatalf("применение миграций: %v", err)
 	}
 
