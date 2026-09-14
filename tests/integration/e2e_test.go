@@ -457,6 +457,7 @@ func TestEndToEndCompleteUserJourney(t *testing.T) {
 		app.EnvJWTSecret:             "e2e-super-secret-key-for-test",
 		app.EnvPasswordHashCost:      strconv.Itoa(auth.MinCost),
 		app.EnvAccrualPollInterval:   "10ms",
+		app.EnvAccrualBatchSize:      "4",
 		app.EnvAccrualLeaseDuration:  "2s",
 		app.EnvAccrualRequestTimeout: "1s",
 		app.EnvAccrualBackoffBase:    "10ms",

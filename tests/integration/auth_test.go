@@ -115,7 +115,7 @@ func newAuthRouter(t *testing.T) *httptransport.Router {
 		t.Fatalf("сборка маршрутизатора: %v", err)
 	}
 
-	router.Protected().Get("/api/user/test-protected", func(w http.ResponseWriter, r *http.Request) {
+	router.HandleProtected("GET /api/user/test-protected", func(w http.ResponseWriter, r *http.Request) {
 		userID, ok := middleware.UserIDFromContext(r.Context())
 		if !ok {
 			w.WriteHeader(http.StatusInternalServerError)

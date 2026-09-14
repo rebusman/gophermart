@@ -46,9 +46,12 @@ const (
 	// DefaultAccrualBatchSize — число заданий, выбираемых за один цикл.
 	DefaultAccrualBatchSize = 32
 
+	// DefaultAccrualConcurrency — предел одновременно обрабатываемых заданий
+	DefaultAccrualConcurrency = 4
+
 	DefaultAccrualRequestTimeout = 5 * time.Second
 
-	DefaultAccrualLeaseDuration = 30 * time.Second
+	DefaultAccrualLeaseDuration = 60 * time.Second
 
 	DefaultAccrualBackoffBase = 5 * time.Second
 
@@ -88,6 +91,9 @@ const (
 
 	// EnvAccrualBatchSize задаёт число заданий, выбираемых за один цикл.
 	EnvAccrualBatchSize = "ACCRUAL_BATCH_SIZE"
+
+	// EnvAccrualConcurrency задаёт предел одновременно обрабатываемых заданий
+	EnvAccrualConcurrency = "ACCRUAL_CONCURRENCY"
 
 	// EnvAccrualRequestTimeout задаёт предельное время обращения к внешней
 	EnvAccrualRequestTimeout = "ACCRUAL_REQUEST_TIMEOUT"
@@ -177,6 +183,9 @@ type Config struct {
 	// AccrualBatchSize — число заданий, выбираемых за один цикл, переменная
 	AccrualBatchSize int
 
+	// AccrualConcurrency — предел одновременно обрабатываемых заданий порции,
+	AccrualConcurrency int
+
 	// AccrualRequestTimeout — предельное время одного обращения к внешней
 	AccrualRequestTimeout time.Duration
 
@@ -215,6 +224,7 @@ func LoadConfig(args []string, lookupEnv func(string) (string, bool)) (Config, e
 		TokenTTL:               DefaultTokenTTL,
 		AccrualPollInterval:    DefaultAccrualPollInterval,
 		AccrualBatchSize:       DefaultAccrualBatchSize,
+		AccrualConcurrency:     DefaultAccrualConcurrency,
 		AccrualRequestTimeout:  DefaultAccrualRequestTimeout,
 		AccrualLeaseDuration:   DefaultAccrualLeaseDuration,
 		AccrualBackoffBase:     DefaultAccrualBackoffBase,
@@ -288,6 +298,7 @@ func (c Config) LogValue() slog.Value {
 		slog.Duration("token_ttl", c.TokenTTL),
 		slog.Duration("accrual_poll_interval", c.AccrualPollInterval),
 		slog.Int("accrual_batch_size", c.AccrualBatchSize),
+		slog.Int("accrual_concurrency", c.AccrualConcurrency),
 		slog.Duration("accrual_request_timeout", c.AccrualRequestTimeout),
 		slog.Duration("accrual_lease_duration", c.AccrualLeaseDuration),
 		slog.Duration("accrual_backoff_base", c.AccrualBackoffBase),
@@ -345,6 +356,14 @@ func accrualDurations(cfg *Config) map[string]*time.Duration {
 	}
 }
 
+// accrualCounts сопоставляет переменной окружения поле конфигурации,
+func accrualCounts(cfg *Config) map[string]*int {
+	return map[string]*int{
+		EnvAccrualBatchSize:   &cfg.AccrualBatchSize,
+		EnvAccrualConcurrency: &cfg.AccrualConcurrency,
+	}
+}
+
 // applyAccrualEnv читает параметры фонового расчёта из окружения поверх
 func applyAccrualEnv(cfg *Config, env envReader) error {
 	for key, field := range accrualDurations(cfg) {
@@ -361,13 +380,18 @@ func applyAccrualEnv(cfg *Config, env envReader) error {
 		*field = value
 	}
 
-	if raw, ok := env.Lookup(EnvAccrualBatchSize); ok {
-		size, err := strconv.Atoi(raw)
-		if err != nil {
-			return fmt.Errorf("недопустимое значение %s %q: %w", EnvAccrualBatchSize, raw, err)
+	for key, field := range accrualCounts(cfg) {
+		raw, ok := env.Lookup(key)
+		if !ok {
+			continue
 		}
 
-		cfg.AccrualBatchSize = size
+		value, err := strconv.Atoi(raw)
+		if err != nil {
+			return fmt.Errorf("недопустимое значение %s %q: %w", key, raw, err)
+		}
+
+		*field = value
 	}
 
 	return nil
@@ -390,11 +414,15 @@ func (c Config) validateAccrual() error {
 		}
 	}
 
-	if c.AccrualBatchSize <= 0 {
-		return fmt.Errorf(
-			"недопустимое значение %s %d: ожидается положительное число",
-			EnvAccrualBatchSize, c.AccrualBatchSize,
-		)
+	counts := map[string]int{
+		EnvAccrualBatchSize:   c.AccrualBatchSize,
+		EnvAccrualConcurrency: c.AccrualConcurrency,
+	}
+
+	for key, value := range counts {
+		if value <= 0 {
+			return fmt.Errorf("недопустимое значение %s %d: ожидается положительное число", key, value)
+		}
 	}
 
 	if c.AccrualBackoffCap < c.AccrualBackoffBase {
@@ -404,15 +432,26 @@ func (c Config) validateAccrual() error {
 		)
 	}
 
-	if c.AccrualLeaseDuration <= c.AccrualRequestTimeout {
+	if batch := c.accrualBatchDuration(); c.AccrualLeaseDuration <= batch {
 		return fmt.Errorf(
-			"срок аренды задания %s не превышает предельное время обращения %s: "+
-				"аренда истечёт до завершения вызова, и задание возьмёт другой экземпляр",
-			c.AccrualLeaseDuration, c.AccrualRequestTimeout,
+			"срок аренды задания %s %s не превышает худшее время обработки порции %s "+
+				"(%s %d, делённый на %s %d с округлением вверх, умноженный на %s %s): "+
+				"аренда истечёт до завершения порции, и её задания возьмёт другой экземпляр",
+			EnvAccrualLeaseDuration, c.AccrualLeaseDuration, batch,
+			EnvAccrualBatchSize, c.AccrualBatchSize,
+			EnvAccrualConcurrency, c.AccrualConcurrency,
+			EnvAccrualRequestTimeout, c.AccrualRequestTimeout,
 		)
 	}
 
 	return nil
+}
+
+// accrualBatchDuration возвращает худшее время обработки порции.
+func (c Config) accrualBatchDuration() time.Duration {
+	waves := (c.AccrualBatchSize + c.AccrualConcurrency - 1) / c.AccrualConcurrency
+
+	return time.Duration(waves) * c.AccrualRequestTimeout
 }
 
 // RedactDSN скрывает пароль в строке подключения к базе данных, сохраняя

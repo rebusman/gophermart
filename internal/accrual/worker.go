@@ -5,7 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
+	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"gophermart/internal/domain"
 	"gophermart/internal/logging"
@@ -31,6 +35,9 @@ type WorkerConfig struct {
 	// BatchSize — число заданий, выбираемых за один цикл.
 	BatchSize int
 
+	// Concurrency — предел одновременно обрабатываемых заданий порции.
+	Concurrency int
+
 	// LeaseDuration — срок аренды выбранного задания.
 	LeaseDuration time.Duration
 }
@@ -52,6 +59,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	w.logger.InfoContext(ctx, "фоновый расчёт начислений запущен",
 		slog.Duration("poll_interval", w.cfg.PollInterval),
 		slog.Int("batch_size", w.cfg.BatchSize),
+		slog.Int("concurrency", w.cfg.Concurrency),
 		slog.Duration("lease", w.cfg.LeaseDuration))
 
 	for {
@@ -88,28 +96,88 @@ func (w *Worker) cycle(ctx context.Context) time.Duration {
 		return w.cfg.PollInterval
 	}
 
-	for i, job := range jobs {
+	batch := &batchState{}
+
+	// Контекст группы не используется: его отмена при первой ошибке прервала
+	var group errgroup.Group
+
+	group.SetLimit(w.cfg.Concurrency)
+
+	for _, job := range jobs {
 		if ctx.Err() != nil {
-			return w.cfg.PollInterval
+			break
 		}
 
-		err = w.service.Process(ctx, job)
-		if err == nil {
+		if batch.paused() {
+			batch.skip(job)
+
 			continue
 		}
 
-		var rateLimit *domain.RateLimitError
-		if errors.As(err, &rateLimit) {
-			return w.pause(ctx, jobs[i:], rateLimit.RetryAfter)
-		}
+		// Go блокируется до освобождения слота, поэтому цикл запуска сам
+		group.Go(func() error {
+			w.process(ctx, job, batch)
 
-		if ctx.Err() == nil {
-			w.logger.ErrorContext(ctx, "обработка заказа не выполнена",
-				slog.String("order", job.Number.String()), logging.ErrorAttr(err))
-		}
+			return nil
+		})
+	}
+
+	// Ни одна функция группы не возвращает ошибку: сбой одного заказа не
+	_ = group.Wait()
+
+	if ctx.Err() != nil {
+		return w.cfg.PollInterval
+	}
+
+	if retryAfter, remaining, paused := batch.outcome(); paused {
+		return w.pause(ctx, remaining, retryAfter)
 	}
 
 	return w.cfg.PollInterval
+}
+
+// process обрабатывает одно задание порции.
+func (w *Worker) process(ctx context.Context, job domain.AccrualJob, batch *batchState) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			w.logPanic(ctx, job, recovered)
+		}
+	}()
+
+	if ctx.Err() != nil {
+		return
+	}
+
+	if batch.paused() {
+		batch.skip(job)
+
+		return
+	}
+
+	err := w.service.Process(ctx, job)
+	if err == nil {
+		return
+	}
+
+	var rateLimit *domain.RateLimitError
+	if errors.As(err, &rateLimit) {
+		batch.pause(job, rateLimit.RetryAfter)
+
+		return
+	}
+
+	if ctx.Err() == nil {
+		w.logger.ErrorContext(ctx, "обработка заказа не выполнена",
+			slog.String("order", job.Number.String()), logging.ErrorAttr(err))
+	}
+}
+
+// logPanic записывает аварийное завершение обработки задания.
+func (w *Worker) logPanic(ctx context.Context, job domain.AccrualJob, recovered any) {
+	w.logger.ErrorContext(ctx, "panic при обработке заказа",
+		slog.Any("panic", recovered),
+		slog.String("stack", string(debug.Stack())),
+		slog.String("order", job.Number.String()))
 }
 
 // pause освобождает необработанный остаток порции и возвращает длительность
@@ -123,6 +191,48 @@ func (w *Worker) pause(ctx context.Context, remaining []domain.AccrualJob, retry
 	}
 
 	return retryAfter
+}
+
+// batchState — состояние порции, общее для goroutine её заданий.
+type batchState struct {
+	mu         sync.Mutex
+	suspended  bool
+	retryAfter time.Duration
+	remaining  []domain.AccrualJob
+}
+
+// paused сообщает, приостановлена ли порция отказом по лимиту запросов.
+func (b *batchState) paused() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.suspended
+}
+
+// skip откладывает до освобождения задание, не начатое из-за приостановки.
+func (b *batchState) skip(job domain.AccrualJob) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.remaining = append(b.remaining, job)
+}
+
+// pause приостанавливает порцию и откладывает до освобождения задание,
+func (b *batchState) pause(job domain.AccrualJob, retryAfter time.Duration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.suspended = true
+	b.retryAfter = max(b.retryAfter, retryAfter)
+	b.remaining = append(b.remaining, job)
+}
+
+// outcome возвращает паузу, отложенные задания и признак приостановки.
+func (b *batchState) outcome() (time.Duration, []domain.AccrualJob, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.retryAfter, b.remaining, b.suspended
 }
 
 // sleep ожидает d, прерываясь отменой контекста.
@@ -159,6 +269,10 @@ func (c WorkerConfig) Validate() error {
 
 	if c.BatchSize <= 0 {
 		return fmt.Errorf("%w: размер порции %d", ErrMissingWorkerConfig, c.BatchSize)
+	}
+
+	if c.Concurrency <= 0 {
+		return fmt.Errorf("%w: предел одновременных обращений %d", ErrMissingWorkerConfig, c.Concurrency)
 	}
 
 	if c.LeaseDuration <= 0 {

@@ -87,8 +87,8 @@ func newRouterConfig(logs *bytes.Buffer) httptransport.RouterConfig {
 // одним зарегистрированным публичным маршрутом, отвечающим кодом 200.
 //
 // Путь тестового маршрута не совпадает с путями сервиса: маршруты заказов
-// регистрирует сам конструктор, и повторная регистрация того же пути подменила
-// бы проверяемый обработчик.
+// регистрирует сам конструктор, и повторная регистрация того же шаблона
+// привела бы к панике http.ServeMux.
 func newRouter(t *testing.T) (*httptransport.Router, *bytes.Buffer) {
 	t.Helper()
 
@@ -99,13 +99,13 @@ func newRouter(t *testing.T) (*httptransport.Router, *bytes.Buffer) {
 		t.Fatalf("сборка маршрутизатора: %v", err)
 	}
 
-	router.Post("/api/user/тестовый-маршрут", func(w http.ResponseWriter, _ *http.Request) {
+	router.HandleFunc("POST /api/user/тестовый-маршрут", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "принято")
 	})
 
 	// Маршрут читает тело целиком и потому обнаруживает превышение лимита
 	// даже тогда, когда длина запроса заранее неизвестна.
-	router.Post("/echo", func(w http.ResponseWriter, r *http.Request) {
+	router.HandleFunc("POST /echo", func(w http.ResponseWriter, r *http.Request) {
 		body, readErr := io.ReadAll(r.Body)
 		if readErr != nil {
 			if middleware.IsBodyTooLarge(readErr) {
@@ -189,6 +189,9 @@ func TestRouterReturnsNotFoundForUnknownPath(t *testing.T) {
 	}
 }
 
+// TestRouterReturnsMethodNotAllowed закрепляет сценарий «Неподдерживаемый
+// метод»: известный путь с неподдерживаемым методом получает 405 и заголовок
+// Allow с методами, которые путь поддерживает.
 func TestRouterReturnsMethodNotAllowed(t *testing.T) {
 	router, _ := newRouter(t)
 
@@ -197,6 +200,10 @@ func TestRouterReturnsMethodNotAllowed(t *testing.T) {
 
 	if recorder.Code != http.StatusMethodNotAllowed {
 		t.Errorf("неожиданный код ответа: got %d, want %d", recorder.Code, http.StatusMethodNotAllowed)
+	}
+
+	if got, want := recorder.Header().Get("Allow"), "GET, HEAD, POST"; got != want {
+		t.Errorf("неожиданный заголовок Allow: got %q, want %q", got, want)
 	}
 }
 
@@ -275,7 +282,7 @@ func TestRouterRecoversFromPanicInHandler(t *testing.T) {
 		t.Fatalf("сборка маршрутизатора: %v", err)
 	}
 
-	router.Get("/panic", func(http.ResponseWriter, *http.Request) {
+	router.HandleFunc("GET /panic", func(http.ResponseWriter, *http.Request) {
 		panic("падение обработчика")
 	})
 
@@ -305,8 +312,9 @@ func TestRouterSetsRequestIDOnEveryResponse(t *testing.T) {
 func TestRouterAppliesMiddlewareWithoutRegisteredRoutes(t *testing.T) {
 	logs := &bytes.Buffer{}
 
-	// Маршруты намеренно не регистрируются: цепочка сквозных обработчиков
-	// обязана работать и на «пустом» сервисе.
+	// Дополнительные маршруты намеренно не регистрируются: цепочка сквозных
+	// обработчиков обязана работать и на ответах, которые формирует сам
+	// маршрутизатор.
 	router, err := httptransport.NewRouter(newRouterConfig(logs))
 	if err != nil {
 		t.Fatalf("сборка маршрутизатора: %v", err)
@@ -341,7 +349,7 @@ func TestRouterAppliesMiddlewareWithoutRegisteredRoutes(t *testing.T) {
 
 // TestRouterProtectsOrderRoutes закрепляет сценарий «Запрос без токена»
 // требования «Доступ к заказам только аутентифицированному пользователю»: оба
-// маршрута заказов зарегистрированы в группе защищённых, а неизвестный путь
+// маршрута заказов зарегистрированы как защищённые, а неизвестный путь
 // по-прежнему даёт 404.
 func TestRouterProtectsOrderRoutes(t *testing.T) {
 	router, _ := newRouter(t)
@@ -370,8 +378,9 @@ func TestRouterProtectsOrderRoutes(t *testing.T) {
 
 // TestRouterProtectsBalanceRoutes закрепляет сценарий «Запрос без токена»
 // требования «Доступ к счёту только аутентифицированному пользователю»: все
-// три маршрута счёта зарегистрированы в группе защищённых, неизвестный путь
-// по-прежнему даёт 404, а известный путь с неподдерживаемым методом — 405.
+// три маршрута счёта зарегистрированы как защищённые, неизвестный путь
+// по-прежнему даёт 404, а известный путь с неподдерживаемым методом — 405 с
+// заголовком Allow ещё до проверки токена.
 func TestRouterProtectsBalanceRoutes(t *testing.T) {
 	router, _ := newRouter(t)
 
@@ -379,13 +388,20 @@ func TestRouterProtectsBalanceRoutes(t *testing.T) {
 		method string
 		path   string
 		status int
+		allow  string
 	}{
 		{method: http.MethodGet, path: "/api/user/balance", status: http.StatusUnauthorized},
 		{method: http.MethodPost, path: "/api/user/balance/withdraw", status: http.StatusUnauthorized},
 		{method: http.MethodGet, path: "/api/user/withdrawals", status: http.StatusUnauthorized},
 		{method: http.MethodGet, path: "/api/user/balance/withdrawals", status: http.StatusNotFound},
-		{method: http.MethodPost, path: "/api/user/withdrawals", status: http.StatusMethodNotAllowed},
-		{method: http.MethodDelete, path: "/api/user/balance", status: http.StatusMethodNotAllowed},
+		{
+			method: http.MethodPost, path: "/api/user/withdrawals",
+			status: http.StatusMethodNotAllowed, allow: "GET, HEAD",
+		},
+		{
+			method: http.MethodDelete, path: "/api/user/balance",
+			status: http.StatusMethodNotAllowed, allow: "GET, HEAD",
+		},
 	}
 
 	for _, test := range tests {
@@ -395,6 +411,10 @@ func TestRouterProtectsBalanceRoutes(t *testing.T) {
 
 			if recorder.Code != test.status {
 				t.Errorf("неожиданный код ответа: got %d, want %d", recorder.Code, test.status)
+			}
+
+			if got := recorder.Header().Get("Allow"); got != test.allow {
+				t.Errorf("неожиданный заголовок Allow: got %q, want %q", got, test.allow)
 			}
 		})
 	}
@@ -434,6 +454,73 @@ func TestRouterServesBalanceRoutesWithToken(t *testing.T) {
 
 			if recorder.Code != test.status {
 				t.Errorf("неожиданный код ответа: got %d, want %d", recorder.Code, test.status)
+			}
+		})
+	}
+}
+
+// serveOverNetwork выполняет запрос к маршрутизатору через настоящий
+// HTTP-сервер и возвращает код ответа и прочитанное тело.
+//
+// Через httptest.ResponseRecorder тело ответа на HEAD не проверить: его
+// отбрасывает сервер, а не обработчик.
+func serveOverNetwork(t *testing.T, server *httptest.Server, method, path string, token string) (int, []byte) {
+	t.Helper()
+
+	request, err := http.NewRequestWithContext(t.Context(), method, server.URL+path, nil)
+	if err != nil {
+		t.Fatalf("создание запроса: %v", err)
+	}
+
+	if token != "" {
+		request.Header.Set(middleware.HeaderAuthorization, middleware.BearerScheme+" "+token)
+	}
+
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatalf("выполнение запроса %s %s: %v", method, path, err)
+	}
+
+	defer func() {
+		if closeErr := response.Body.Close(); closeErr != nil {
+			t.Errorf("закрытие тела ответа: %v", closeErr)
+		}
+	}()
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("чтение тела ответа: %v", err)
+	}
+
+	return response.StatusCode, body
+}
+
+// TestRouterServesHeadForGetRoutes закрепляет сценарии «HEAD к маршруту с GET»
+// и «HEAD к защищённому маршруту без токена»: HEAD получает тот же код, что и
+// GET, пустое тело и ту же проверку токена.
+func TestRouterServesHeadForGetRoutes(t *testing.T) {
+	router, _ := newRouter(t)
+
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+
+	const token = "тестовый-токен"
+
+	for _, path := range []string{"/api/user/balance", "/api/user/orders", "/api/user/withdrawals"} {
+		t.Run(path, func(t *testing.T) {
+			getStatus, _ := serveOverNetwork(t, server, http.MethodGet, path, token)
+			headStatus, headBody := serveOverNetwork(t, server, http.MethodHead, path, token)
+
+			if headStatus != getStatus {
+				t.Errorf("код ответа на HEAD: got %d, want %d как на GET", headStatus, getStatus)
+			}
+
+			if len(headBody) != 0 {
+				t.Errorf("ответ на HEAD содержит тело: %q", headBody)
+			}
+
+			if status, _ := serveOverNetwork(t, server, http.MethodHead, path, ""); status != http.StatusUnauthorized {
+				t.Errorf("HEAD без токена: got %d, want %d", status, http.StatusUnauthorized)
 			}
 		})
 	}

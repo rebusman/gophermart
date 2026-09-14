@@ -40,8 +40,8 @@
      │ orders           │          └───────────▲────────────┘
      │ balances         │                      │
      │ withdrawals      │          ┌───────────┴────────────┐
-     │ ledger           │          │ Background accrual      │
-     └──────────────────┘          │ worker / poller         │
+     └──────────────────┘          │ Background accrual     │
+                                   │ worker / poller        │
                                    └────────────────────────┘
 ```
 
@@ -56,70 +56,81 @@
 
 ```text
 gophermart/
+├── api/
+│   └── openapi.yaml
 ├── cmd/
 │   └── gophermart/
 │       └── main.go
 ├── internal/
 │   ├── app/
 │   │   ├── app.go
-│   │   └── config.go
+│   │   ├── config.go
+│   │   ├── env.go
+│   │   └── run.go
 │   ├── domain/
-│   │   ├── user.go
+│   │   ├── accrual.go
+│   │   ├── errors.go
 │   │   ├── order.go
-│   │   ├── balance.go
-│   │   ├── withdrawal.go
-│   │   ├── ledger.go
-│   │   └── errors.go
-│   ├── service/
-│   │   ├── auth.go
-│   │   ├── orders.go
-│   │   ├── balance.go
-│   │   └── withdrawals.go
+│   │   ├── order_upload.go
+│   │   ├── user.go
+│   │   └── withdrawal.go
 │   ├── repository/
-│   │   ├── user.go
-│   │   ├── order.go
+│   │   ├── accrual.go
 │   │   ├── balance.go
-│   │   ├── withdrawal.go
-│   │   └── tx.go
+│   │   ├── order.go
+│   │   └── user.go
+│   ├── service/
+│   │   ├── accrual.go
+│   │   ├── auth.go
+│   │   ├── balance.go
+│   │   └── order.go
 │   ├── storage/
 │   │   └── postgres/
 │   │       ├── postgres.go
+│   │       ├── migrate.go
 │   │       ├── user_repository.go
 │   │       ├── order_repository.go
+│   │       ├── accrual_repository.go
 │   │       ├── balance_repository.go
-│   │       ├── withdrawal_repository.go
-│   │       └── migrations/
+│   │       ├── numeric.go
+│   │       └── uuid.go
 │   ├── transport/
 │   │   └── http/
 │   │       ├── router.go
 │   │       ├── handlers/
 │   │       │   ├── auth.go
 │   │       │   ├── orders.go
-│   │       │   ├── balance.go
-│   │       │   └── withdrawals.go
+│   │       │   └── balance.go
 │   │       ├── middleware/
 │   │       │   ├── auth.go
+│   │       │   ├── bodylimit.go
 │   │       │   ├── gzip.go
+│   │       │   ├── logging.go
 │   │       │   ├── recovery.go
-│   │       │   └── logging.go
+│   │       │   └── requestid.go
 │   │       └── dto/
-│   │           ├── request.go
-│   │           └── response.go
+│   │           ├── auth.go
+│   │           ├── balance.go
+│   │           ├── money.go
+│   │           └── order.go
 │   ├── auth/
 │   │   ├── password.go
 │   │   └── token.go
 │   ├── accrual/
 │   │   ├── client.go
-│   │   ├── model.go
 │   │   └── worker.go
+│   ├── logging/
+│   │   └── logging.go
 │   └── validator/
 │       └── luhn.go
 ├── migrations/
+│   ├── migrations.go
+│   └── *.sql
 ├── tests/
 │   ├── integration/
 │   └── testutil/
 ├── go.mod
-├── Dockerfile
+├── Makefile
 ├── docker-compose.yml
 └── README.md
 ```
@@ -166,114 +177,96 @@ CREATE TABLE users (
 ### Заказы
 
 ```sql
-CREATE TYPE order_status AS ENUM (
-    'NEW',
-    'PROCESSING',
-    'INVALID',
-    'PROCESSED'
-);
-
 CREATE TABLE orders (
-    id                    UUID PRIMARY KEY,
-    number                TEXT NOT NULL,
-    user_id               UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    status                order_status NOT NULL DEFAULT 'NEW',
-    accrual               NUMERIC(18,2),
-    uploaded_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    number          TEXT PRIMARY KEY,
+    user_id         UUID NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    status          TEXT NOT NULL,
+    accrual         NUMERIC(18, 2),
+    uploaded_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-    next_check_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-    processing_started_at TIMESTAMPTZ,
-    attempts              INTEGER NOT NULL DEFAULT 0,
-    last_error            TEXT,
-    finalized_at          TIMESTAMPTZ,
-
-    CONSTRAINT orders_number_unique UNIQUE (number),
-    CONSTRAINT orders_accrual_nonnegative CHECK (
-        accrual IS NULL OR accrual >= 0
-    )
+    CONSTRAINT orders_status_known CHECK (status IN ('NEW', 'PROCESSING', 'INVALID', 'PROCESSED'))
 );
 
-CREATE INDEX orders_user_uploaded_idx
-    ON orders (user_id, uploaded_at DESC);
+CREATE INDEX orders_user_uploaded_at_idx
+    ON orders (user_id, uploaded_at DESC, number DESC);
 
-CREATE INDEX orders_pending_check_idx
-    ON orders (next_check_at)
+-- Состояние планировщика повторных проверок приходит отдельной миграцией
+-- вместе с фоновым воркером: обе колонки принадлежат фоновому процессу, а не
+-- заказу, и в контракт API не входят.
+ALTER TABLE orders
+    ADD COLUMN attempts        INTEGER     NOT NULL DEFAULT 0,
+    ADD COLUMN next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+ALTER TABLE orders
+    ADD CONSTRAINT orders_attempts_nonnegative CHECK (attempts >= 0);
+
+-- Индекс частичный: заказы в окончательных состояниях в выборку не попадают
+-- никогда, а со временем составляют подавляющее большинство строк.
+CREATE INDEX orders_pending_next_attempt_idx
+    ON orders (next_attempt_at)
     WHERE status IN ('NEW', 'PROCESSING');
 ```
 
-Глобальное ограничение `UNIQUE(number)` необходимо для поведения API:
+Первичным ключом служит сам номер заказа, а не суррогатный `UUID`: номер уникален глобально по требованию предметной области, неизменен и участвует в каждом обращении к заказу. Требуемое контрактом API поведение обеспечивается тем же ключом:
 
 - тот же пользователь повторно отправил номер — `200`;
 - номер принадлежит другому пользователю — `409`;
 - номер новый — создаётся заказ и возвращается `202`.
 
-### Баланс и ledger
+Тип номера — `TEXT`: длина номера ничем не ограничена и легко выходит за пределы `BIGINT`, арифметика над ним не выполняется, а ведущий ноль значим.
 
-Для надёжной реализации полезно хранить и текущий баланс, и неизменяемую историю операций.
+Статус — `TEXT` с ограничением `CHECK`, а не тип `ENUM`. Словарь статусов задан внешним контрактом системы расчёта и меняться не может, а `CHECK` даёт ту же защиту от постороннего значения, читается в диффе миграции и не требует `ALTER TYPE` при уточнении словаря.
+
+Отдельных колонок захвата (`processing_started_at`, `finalized_at`, `last_error`) в схеме нет: арендой занятого задания служит сдвиг `next_attempt_at` вперёд, а окончательность заказа выражена самим статусом.
+
+### Счёт лояльности
+
+Баллы хранятся агрегатом: текущий остаток и накопленная сумма списаний лежат в одной строке на пользователя.
 
 ```sql
 CREATE TABLE balances (
-    user_id            UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    current            NUMERIC(18,2) NOT NULL DEFAULT 0,
-    withdrawn_total    NUMERIC(18,2) NOT NULL DEFAULT 0,
+    user_id            UUID PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE,
+    current            NUMERIC(18, 2) NOT NULL DEFAULT 0,
+    withdrawn_total    NUMERIC(18, 2) NOT NULL DEFAULT 0,
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT balances_current_nonnegative CHECK (current >= 0),
     CONSTRAINT balances_withdrawn_nonnegative CHECK (withdrawn_total >= 0)
 );
-
-CREATE TYPE ledger_operation AS ENUM ('ACCRUAL', 'WITHDRAWAL');
-
-CREATE TABLE balance_ledger (
-    id                 UUID PRIMARY KEY,
-    user_id            UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    operation          ledger_operation NOT NULL,
-    amount             NUMERIC(18,2) NOT NULL CHECK (amount > 0),
-    order_id           UUID REFERENCES orders(id) ON DELETE RESTRICT,
-    withdrawal_id      UUID REFERENCES withdrawals(id) ON DELETE RESTRICT,
-    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-
-    CONSTRAINT ledger_operation_source CHECK (
-           (operation = 'ACCRUAL'    AND order_id      IS NOT NULL AND withdrawal_id IS NULL)
-        OR (operation = 'WITHDRAWAL' AND withdrawal_id IS NOT NULL AND order_id      IS NULL)
-    )
-);
-
--- Ровно одно начисление на заказ.
-CREATE UNIQUE INDEX ledger_accrual_order_uniq
-    ON balance_ledger (order_id)
-    WHERE order_id IS NOT NULL;
 ```
 
-Уникальность начисления задаётся именно частичным индексом, а не ограничением на колонку. Вариант `UNIQUE NULLS NOT DISTINCT (order_id)` здесь неприменим: у всех записей с `operation = 'WITHDRAWAL'` поле `order_id` равно `NULL`, а `NULLS NOT DISTINCT` считает все `NULL` равными между собой — тогда во всей таблице разрешено ровно одно списание, и второе падает с `unique_violation`. Условие `WHERE order_id IS NOT NULL` выводит записи списаний из-под ограничения.
+`balances` создаётся одной миграцией с `users`: регистрация обязана заводить учётную запись и её пустой счёт в одной транзакции, поэтому счёт не может появиться позже пользователя.
 
-`CHECK (ledger_operation_source)` не даёт создать запись, у которой тип операции не соответствует заполненной ссылке: начисление без заказа или списание без факта списания.
+#### Почему нет таблицы-журнала
 
-`balance_ledger` позволяет:
+Отдельной неизменяемой истории движений баллов (`balance_ledger`) в схеме нет. Это осознанное решение, принятое в изменении `balance-withdrawals` и зафиксированное в `openspec/changes/archive/2026-09-02-balance-withdrawals/design.md`; `AGENTS.md` перечисляет такую таблицу среди минимальных сущностей, и отступление от него описано там же.
 
-- объяснить любое изменение баланса;
-- проводить аудит;
-- предотвратить повторное начисление одного заказа;
-- сверять агрегированный баланс с историей операций.
+Журнал предлагался ради одного свойства — барьер против повторного применения операции должен находиться в базе, а не в коде сервиса. Свойство сохранено, барьер перенесён на ограничения тех таблиц, которые контракт требует и без журнала:
 
-Схема выше показана в финальном виде. При пофичной нарезке миграций `balance_ledger` создаётся вместе с механикой начислений, когда таблицы `withdrawals` ещё нет, поэтому колонка `withdrawal_id`, внешний ключ на `withdrawals` и ограничение `ledger_operation_source` добавляются отдельной `ALTER`-миграцией вместе со списаниями.
+- у списания — первичный ключ `withdrawals (user_id, order_number)`: повтор не создаёт вторую строку, и `ON CONFLICT DO NOTHING` превращает его в обычную ветвь кода;
+- у начисления — условие перевода заказа из непройденного окончательного состояния: `UPDATE orders ... WHERE status NOT IN ('PROCESSED', 'INVALID')` затрагивает ноль строк, если заказ уже финализирован, и счёт в этом случае не изменяется вовсе.
+
+Цена решения названа явно: изменение остатка объясняется парой «заказы + списания», а не одной таблицей, и отдельного аудиторского следа нет. Ввести журнал позже можно отдельной миграцией, не меняя ни контракта API, ни существующих таблиц.
 
 ### Списания
 
 ```sql
 CREATE TABLE withdrawals (
-    id                 UUID PRIMARY KEY,
-    user_id            UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    order_number       TEXT NOT NULL,
-    amount             NUMERIC(18,2) NOT NULL CHECK (amount > 0),
-    processed_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    user_id         UUID NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    order_number    TEXT NOT NULL,
+    sum             NUMERIC(18, 2) NOT NULL,
+    processed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-    CONSTRAINT withdrawals_user_order_unique UNIQUE (user_id, order_number)
+    PRIMARY KEY (user_id, order_number),
+
+    CONSTRAINT withdrawals_sum_positive CHECK (sum > 0)
 );
 
-CREATE INDEX withdrawals_user_processed_idx
-    ON withdrawals (user_id, processed_at DESC);
+CREATE INDEX withdrawals_user_processed_at_idx
+    ON withdrawals (user_id, processed_at DESC, order_number DESC);
 ```
+
+Первичный ключ композитный и совпадает с требуемым предметной областью ограничением уникальности: суррогатный `id` добавил бы второй индекс, не давая ничего — на отдельное списание никто не ссылается, журнала движений в схеме нет, а эндпоинта адресации списания нет в контракте. Внешнего ключа на `orders` тоже нет: номер заказа в списании гипотетический и не обязан существовать среди загруженных заказов. Колонка называется `sum`, а не `amount`, — так имя колонки, поля DTO и поля JSON совпадают.
 
 Уникальность номера списания задана в пределах пользователя, а не глобально. Причина в контракте ТЗ: для `POST /api/user/balance/withdraw` набор кодов ответа — `200`, `401`, `402`, `422`, `500`, и кода «номер уже использован другим пользователем» в нём нет. Глобальный `UNIQUE(order_number)` превращал бы такой случай в `500` на ровном месте.
 
@@ -309,7 +302,7 @@ CREATE INDEX withdrawals_user_processed_idx
 Алгоритм:
 
 1. Проверить аутентификацию.
-2. Прочитать body с ограничением размера, например до 4 KiB.
+2. Прочитать body с ограничением размера: общий лимит задаёт middleware `BodyLimit` (по умолчанию 1 MiB).
 3. Удалить завершающий перевод строки, если он поддерживается.
 4. Проверить, что значение состоит только из цифр.
 5. Проверить номер по алгоритму Луна; при ошибке вернуть `422`.
@@ -322,7 +315,7 @@ CREATE INDEX withdrawals_user_processed_idx
 Проверка Луна должна быть отдельной чистой функцией:
 
 ```go
-func ValidLuhn(number string) bool
+func Luhn(digits string) bool
 ```
 
 ### Асинхронное начисление
@@ -330,53 +323,62 @@ func ValidLuhn(number string) bool
 Воркер запускается внутри того же бинарника в отдельной goroutine. При нескольких репликах каждый экземпляр запускает свой воркер, а PostgreSQL предотвращает двойную обработку.
 
 ```text
-каждые N секунд:
-    начать короткую транзакцию
-    выбрать до batchSize заказов:
+каждые PollInterval:
+    выбрать до batchSize заказов одним оператором:
         статус NEW/PROCESSING
-        next_check_at <= now()
-        ORDER BY next_check_at
+        next_attempt_at <= now()
+        ORDER BY next_attempt_at, number
         FOR UPDATE SKIP LOCKED
-    для выбранных записей:
-        увеличить attempts
-        временно сдвинуть next_check_at
-    commit
+        и тем же оператором сдвинуть next_attempt_at на срок аренды
+    (оператор один: его неявная транзакция и есть та короткая транзакция,
+     которой требует безопасная выборка; блокировка снимается её фиксацией)
 
-    для каждого заказа:
+    одновременно, не более Concurrency заказов сразу:
         вызвать Accrual API вне транзакции БД
-        начать новую транзакцию
-        применить результат
-        commit
+        применить результат отдельной транзакцией
+
+    при 429: новые обращения порции не начинать, выполняющиеся довести до конца,
+             не начатые и отклонённые заказы освободить,
+             пауза = наибольший полученный Retry-After
 ```
+
+Аренда выдаётся всей порции в момент выборки, поэтому её срок обязан перекрывать худшее время обработки порции: `ceil(BatchSize / Concurrency) × RequestTimeout`. Паника при обработке одного заказа перехватывается в goroutine задания и не останавливает ни порцию, ни воркер.
+
+Счётчик попыток при выборке не увеличивается: он растёт только после неудачного обращения и обнуляется успешным ответом, оставившим заказ неокончательным. Сдвиг `next_attempt_at` служит арендой — гибель экземпляра между выборкой и применением результата возвращает заказ в работу по её истечении, без отдельной процедуры уборки.
 
 Внешний HTTP-вызов не должен происходить внутри транзакции БД, удерживающей блокировки строк.
 
 ### Отображение статусов Accrual API
 
-| Accrual API | Локальный статус | `accrual` | Дальнейшая обработка |
-|---|---:|---:|---|
-| `200 REGISTERED` | `NEW` | `NULL` | Повторить позднее |
-| `200 PROCESSING` | `PROCESSING` | `NULL` | Повторить позднее |
+| Ответ Accrual API | Состояние заказа | `accrual` | Дальнейшая обработка |
+|---|---|---|---|
+| `200 REGISTERED` | `PROCESSING` | Без изменений | Проверить снова через `PollInterval` |
+| `200 PROCESSING` | `PROCESSING` | Без изменений | Проверить снова через `PollInterval` |
 | `200 INVALID` | `INVALID` | `NULL` | Больше не опрашивать |
 | `200 PROCESSED` | `PROCESSED` | Значение или `NULL` | Больше не опрашивать |
-| `204` | `NEW` | `NULL` | Повторить позднее |
-| `429` | Текущий | Без изменений | Учитывать `Retry-After`, иначе backoff |
-| `500`, timeout, сеть | Текущий | Без изменений | Retry с backoff и jitter |
+| `204` | Без изменений | Без изменений | Повторить с backoff, счётчик попыток растёт |
+| `429` | Без изменений | Без изменений | Учесть `Retry-After`, освободить занятые задания |
+| `500`, timeout, сеть | Без изменений | Без изменений | Повторить с backoff, счётчик попыток растёт |
+
+Словарь состояний заказа не содержит значения для «зарегистрирован, но ещё не рассчитан», поэтому `REGISTERED` и `PROCESSING` отображаются в одно состояние `PROCESSING`; различать их наружу незачем. Отображение выполняет `accrual.ParseStatus`, значение вне словаря контракта приводит к ошибке.
+
+Сумма принимается только у завершённого расчёта: при любом другом статусе присланное значение отбрасывается, поэтому `INVALID` записывает `accrual = NULL`.
+
+Ответ «заказ не зарегистрирован» (`204`) состояние расчёта не меняет: заказ остаётся `NEW` либо `PROCESSING` и проверяется снова с увеличенной отсрочкой.
 
 `PROCESSED` без `accrual` является валидным финальным состоянием: заказ завершён, но бонусы не начислены.
 
-### Идемпотентное начисление
+### Однократное начисление
 
-Если Accrual API вернул `PROCESSED` и `accrual > 0`, в одной транзакции необходимо:
+Ответ, завершающий расчёт (`PROCESSED` или `INVALID`), применяется одной транзакцией:
 
-1. Заблокировать заказ `FOR UPDATE`.
-2. Проверить, что заказ ещё не финализирован и в ledger нет начисления по нему.
-3. Обновить `orders.status = 'PROCESSED'`, `orders.accrual`, `finalized_at`.
-4. Вставить `balance_ledger(operation = 'ACCRUAL')`.
-5. Увеличить `balances.current`.
-6. Зафиксировать транзакцию.
+1. Условный перевод заказа в окончательное состояние вместе с суммой:
+   `UPDATE orders SET status = $2, accrual = $3 WHERE number = $1 AND status NOT IN ('PROCESSED', 'INVALID')`.
+2. Ноль затронутых строк означает, что заказ уже финализирован другим экземпляром: транзакция закрывается, счёт не изменяется.
+3. Иначе — увеличение счёта: `UPDATE balances SET current = current + $2, updated_at = now() WHERE user_id = $1`. Отсутствующая и нулевая сумма счёт не трогают: окончательное состояние без вознаграждения является законным исходом.
+4. Фиксация транзакции.
 
-Защита от двойного начисления строится на проверке статуса и уникальном ограничении ledger-записи по `order_id`.
+Однократность обеспечивает условие первого оператора, а не проверка в Go: решение принимает база по числу затронутых строк. Отдельная блокировка `SELECT ... FOR UPDATE` не нужна — условный `UPDATE` сам блокирует строку и вычисляет условие на её актуальной версии.
 
 ### Списание баллов
 
@@ -396,33 +398,28 @@ BEGIN;
 
 -- 1. Регистрируем списание. Повтор того же номера тем же пользователем
 --    не создаёт строку и не является ошибкой.
-INSERT INTO withdrawals (id, user_id, order_number, amount)
-VALUES ($1, $2, $3, $4)
+INSERT INTO withdrawals (user_id, order_number, sum)
+VALUES ($1, $2, $3)
 ON CONFLICT (user_id, order_number) DO NOTHING
-RETURNING id;
+RETURNING processed_at;
 -- строка не вернулась: списание уже было выполнено ранее.
--- COMMIT без изменений, HTTP 200.
+-- ROLLBACK без изменений, HTTP 200.
 
 -- 2. Проверка достаточности и списание одной атомарной операцией.
 UPDATE balances
-SET current         = current - $4,
-    withdrawn_total = withdrawn_total + $4,
+SET current         = current - $3,
+    withdrawn_total = withdrawn_total + $3,
     updated_at      = now()
-WHERE user_id = $2
-  AND current >= $4
-RETURNING current;
--- строка не вернулась: недостаточно баллов.
+WHERE user_id = $1
+  AND current >= $3;
+-- ноль затронутых строк: недостаточно баллов.
 -- ROLLBACK, вставленное на шаге 1 списание тоже откатывается, HTTP 402.
-
--- 3. Неизменяемая запись в историю операций.
-INSERT INTO balance_ledger (id, user_id, operation, amount, withdrawal_id)
-VALUES ($5, $2, 'WITHDRAWAL', $4, $1);
 
 COMMIT;
 -- HTTP 200
 ```
 
-`UPDATE ... WHERE current >= $4` совмещает проверку доступных баллов и их списание в одной атомарной операции: отдельный `SELECT ... FOR UPDATE` не нужен, а конкурентные списания не могут увести баланс в минус. `CHECK (current >= 0)` остаётся страховкой на случай ошибки в коде.
+`UPDATE ... WHERE current >= $3` совмещает проверку доступных баллов и их списание в одной атомарной операции: отдельный `SELECT ... FOR UPDATE` не нужен, а конкурентные списания не могут увести баланс в минус. `CHECK (current >= 0)` остаётся страховкой на случай ошибки в коде.
 
 Повторный запрос с тем же номером заказа от того же пользователя возвращает `200` и не списывает баллы второй раз. Отдельного кода ответа для этого случая в ТЗ нет, а `409` и `500` в контракте эндпоинта отсутствуют, поэтому выбрана идемпотентность.
 
@@ -503,15 +500,17 @@ type OrderResponse struct {
 
 ```go
 var (
-    ErrLoginTaken         = errors.New("login already taken")
-    ErrInvalidCredentials = errors.New("invalid credentials")
-    ErrUnauthenticated    = errors.New("unauthenticated")
-    ErrOrderAlreadyOwned  = errors.New("order already uploaded by user")
-    ErrOrderOwnedByOther  = errors.New("order already uploaded by another user")
-    ErrInvalidOrderNumber = errors.New("invalid order number")
-    ErrInsufficientFunds  = errors.New("insufficient funds")
+    ErrLoginTaken                = errors.New("логин уже занят")
+    ErrInvalidCredentials        = errors.New("неверная пара логин/пароль")
+    ErrUnauthenticated           = errors.New("запрос не аутентифицирован")
+    ErrInvalidOrderNumber        = errors.New("некорректный номер заказа")
+    ErrOrderBelongsToAnotherUser = errors.New("номер заказа принадлежит другому пользователю")
+    ErrInsufficientFunds         = errors.New("на счёте недостаточно баллов")
+    ErrNonPositiveWithdrawalSum  = errors.New("сумма списания не положительна")
 )
 ```
+
+Повторная загрузка номера его же владельцем ошибкой не является: это законный исход, и сервис возвращает его значением `domain.OrderUploadDuplicate`, которое транспорт отображает в `200`. Полный перечень доменных ошибок — в `internal/domain/errors.go`.
 
 | Событие | HTTP-код |
 |---|---:|
@@ -540,12 +539,18 @@ type Config struct {
     DatabaseURI          string
     AccrualSystemAddress string
 
-    JWTSecret            string
-    AccrualPollInterval  time.Duration
-    AccrualTimeout       time.Duration
-    WorkerBatchSize      int
+    JWTSecret             string
+    AccrualPollInterval   time.Duration
+    AccrualBatchSize      int
+    AccrualConcurrency    int
+    AccrualRequestTimeout time.Duration
+    AccrualLeaseDuration  time.Duration
+    AccrualBackoffBase    time.Duration
+    AccrualBackoffCap     time.Duration
 }
 ```
+
+Показаны только поля, существенные для архитектуры; таймауты HTTP-сервера, лимит тела запроса и параметры пула подключений перечислены в `internal/app/config.go`. Срок аренды задания обязан превышать худшее время обработки порции — `ceil(AccrualBatchSize / AccrualConcurrency) × AccrualRequestTimeout`: аренда выдаётся всей порции сразу, и иначе она истечёт раньше, чем обработка дойдёт до последних заданий.
 
 Приоритет значений:
 
@@ -590,7 +595,7 @@ Recovery
 
 ### Retry и backoff
 
-Для `NEW`, `PROCESSING`, `204`, сетевых ошибок и `500`:
+Неудачное обращение — `204`, `500`, timeout или сетевая ошибка — увеличивает счётчик попыток и отодвигает следующую проверку. Отсрочка удваивается с каждой неудачей от базы и останавливается на потолке:
 
 ```text
 1-я неудача: 5 секунд
@@ -600,49 +605,53 @@ Recovery
 максимум: 5 минут
 ```
 
-Нужен jitter, например ±20 %, чтобы заказы не опрашивались синхронно. Для `429` приоритет имеет заголовок `Retry-After`; при его отсутствии используйте backoff с увеличенной минимальной задержкой.
+Терминального отказа от заказа нет: по достижении потолка проверки продолжаются с постоянным интервалом. Значения задаются переменными `ACCRUAL_BACKOFF_BASE` и `ACCRUAL_BACKOFF_CAP`.
 
-`INVALID` и `PROCESSED` в очередь повторных проверок больше не попадают.
+Успешный ответ, оставивший заказ неокончательным (`REGISTERED` или `PROCESSING`), неудачей не является: счётчик попыток обнуляется, а следующая проверка назначается через обычный интервал опроса. Долгий, но исправно идущий расчёт не должен уезжать на потолок отсрочки.
+
+`429` относится ко всему сервису, а не к заказу: счётчик попыток не растёт, состояние не изменяется, занятые задания освобождаются с паузой из заголовка `Retry-After` (при его отсутствии или неразбираемом значении — из конфигурации), а цикл приостанавливается целиком.
+
+Jitter в текущей реализации отсутствует: отсрочка детерминирована, и заказы, отложенные одним и тем же сбоем внешней системы, возвращаются в выборку одновременно. `SKIP LOCKED` снимает конкуренцию за строки, но пик обращений к внешней системе остаётся; разброс ±20 % — очевидное улучшение, если это станет заметно.
+
+`INVALID` и `PROCESSED` в очередь повторных проверок больше не попадают: их отсекает условие частичного индекса и условие каждого оператора планировщика.
 
 ### Восстановление после сбоев
 
-Если приложение завершилось после захвата задач, блокировки PostgreSQL исчезнут при закрытии транзакции. Заказы с истёкшим `next_check_at` снова попадут в обработку после рестарта.
+Если приложение завершилось после захвата задач, блокировки PostgreSQL исчезнут при закрытии транзакции. Заказы с истёкшим `next_attempt_at` снова попадут в обработку после рестарта: срок аренды и есть время, через которое заказ вернётся в выборку.
 
-Если вводится отдельный промежуточный статус наподобие `CHECKING`, нужен watchdog, возвращающий зависшие записи в очередь. В предлагаемой схеме отдельный статус захвата необязателен: выборка координируется блокировкой БД и временем следующей проверки.
+Отдельного промежуточного статуса захвата наподобие `CHECKING` в схеме нет, поэтому не нужен и watchdog, возвращающий зависшие записи в очередь: выборка координируется блокировкой БД и временем следующей проверки.
 
 ### Миграции
 
-Используйте версионированные SQL-миграции, например `golang-migrate`:
+Схема создаётся версионированными SQL-миграциями (`golang-migrate`), встроенными в бинарник через `embed`:
 
 ```text
 000001_users_balances.up.sql
 000001_users_balances.down.sql
 000002_orders.up.sql
 000002_orders.down.sql
-000003_balance_ledger.up.sql
-000003_balance_ledger.down.sql
-000004_withdrawals.up.sql
-000004_withdrawals.down.sql
+000003_withdrawals.up.sql
+000003_withdrawals.down.sql
+000004_accrual_scheduling.up.sql
+000004_accrual_scheduling.down.sql
 ```
 
-Схема не создаётся одним `init`-файлом: каждая функциональная возможность приносит собственную миграцию. Порядок продиктован внешними ключами:
+Схема не создаётся одним `init`-файлом: каждая функциональная возможность приносит собственную миграцию. Порядок продиктован внешними ключами и порядком реализации возможностей:
 
 ```text
         users
           │
-   ┌──────┴──────┐
-   ▼             ▼
-balances      orders
-   │             │
-   └──────┬──────┘
-          ▼
-   balance_ledger
-          │
-          ▼  ALTER: + withdrawal_id
-     withdrawals
+   ┌──────┴───────┬──────────────┐
+   ▼              ▼              ▼
+balances       orders       withdrawals
+ (000001)     (000002)       (000003)
+                  │
+                  ▼  ALTER: + attempts, next_attempt_at
+            планировщик проверок
+               (000004)
 ```
 
-Отсюда две неочевидные привязки. `balances` создаётся вместе с `users`, потому что регистрация обязана создавать пользователя и пустой баланс в одной транзакции. Колонка `withdrawal_id` в `balance_ledger` добавляется `ALTER`-миграцией вместе со списаниями, так как на момент создания ledger таблицы `withdrawals` ещё не существует.
+Отсюда две неочевидные привязки. `balances` создаётся вместе с `users`, потому что регистрация обязана создавать пользователя и пустой баланс в одной транзакции. Колонки планировщика добавляются `ALTER`-миграцией вместе с фоновым воркером, а не вместе с заказом: они принадлежат фоновому процессу и в контракт чтения заказа не входят. Пустой набор миграций не запускает сервис: схему создавать нечем.
 
 Уже применённая миграция не изменяется: любое изменение схемы оформляется новой миграцией с большей версией.
 
@@ -659,11 +668,10 @@ balances      orders
 | Модуль | Что проверять |
 |---|---|
 | `validator/luhn` | Валидные, невалидные, пустые, нецифровые и длинные номера |
-| `auth/password` | Корректный и неверный пароль, отсутствие plaintext в хеше |
 | `service/auth` | Уникальный логин, неверные credentials, выпуск токена |
-| `service/orders` | Новый заказ, повтор того же пользователя, чужой заказ, Лун |
-| `service/balance` | Однократное начисление, отсутствие accrual, финальные статусы |
-| `service/withdrawals` | Списание ровно доступного баланса, недостаток на 0.01, нулевые и отрицательные суммы |
+| `service/order` | Новый заказ, повтор того же пользователя, чужой заказ, Лун |
+| `service/balance` | Списание ровно доступного баланса, недостаток на 0.01, нулевые и отрицательные суммы |
+| `service/accrual` | Отображение ответов, однократность применения, backoff, лимит запросов |
 | `accrual/client` | Все `200`-статусы, `204`, `429`, `500`, timeout |
 | HTTP handlers | Коды, заголовки, JSON, отсутствие `accrual` при `NULL` |
 
@@ -671,11 +679,10 @@ balances      orders
 
 ### Интеграционные тесты
 
-Полезная необязательная часть:
+Интеграционные тесты работают на настоящем PostgreSQL: адрес базы задаётся переменной `TEST_DATABASE_URI`, и без неё тесты пропускаются, а не падают. Локально база поднимается через `make compose-up`, набор целиком — через `make test-integration`. Проверяется:
 
-- PostgreSQL через Testcontainers;
 - применение реальных миграций;
-- проверка `UNIQUE(number)` при конкурентных запросах;
+- глобальная уникальность номера заказа при конкурентных запросах;
 - два параллельных списания, когда баланса хватает только на одно;
 - идемпотентность начисления;
 - несколько воркеров без двойных начислений;
@@ -689,8 +696,8 @@ balances      orders
 - Не вызывать Accrual API синхронно из `POST /api/user/orders`.
 - Не хранить баллы в `float64`.
 - Не рассчитывать баланс только в Go без транзакций и блокировок БД.
-- Не полагаться на предварительный `SELECT` для уникальности номера: необходимо `UNIQUE(number)` в PostgreSQL.
-- Не начислять баллы без идемпотентной записи, связанной с `order_id`.
+- Не полагаться на предварительный `SELECT` для уникальности номера: глобальную уникальность обеспечивает первичный ключ `orders (number)`.
+- Не начислять баллы без барьера в базе: переход в окончательное состояние должен быть условным `UPDATE`, а не проверкой статуса в Go.
 - Не использовать `SKIP LOCKED` для пользовательских выборок и отчётов: он предназначен для конкурентной обработки очереди.
 
 ## Итог
@@ -700,6 +707,6 @@ balances      orders
 - асинхронную интеграцию с ненадёжным внешним сервисом;
 - корректный баланс при конкурентных списаниях;
 - идемпотентные начисления;
-- аудит операций через ledger;
+- барьеры однократности на уровне ограничений PostgreSQL;
 - возможность запуска нескольких реплик;
 - прозрачную тестируемость через разделение слоёв и зависимостей.

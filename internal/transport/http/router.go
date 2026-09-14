@@ -6,8 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
-
 	"gophermart/internal/transport/http/handlers"
 	"gophermart/internal/transport/http/middleware"
 )
@@ -28,16 +26,15 @@ type RouterConfig struct {
 
 	Balance *handlers.Balance
 
-	// Authenticator — проверка токена доступа для группы защищённых
+	// Authenticator — проверка токена доступа для защищённых маршрутов.
 	Authenticator middleware.Authenticator
 }
 
 // Router — HTTP-маршрутизатор сервиса.
 type Router struct {
-	chi.Router
-
-	handler   http.Handler
-	protected chi.Router
+	mux          *http.ServeMux
+	handler      http.Handler
+	authenticate func(http.Handler) http.Handler
 }
 
 // NewRouter собирает маршрутизатор со сквозными обработчиками.
@@ -46,19 +43,21 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 		return nil, err
 	}
 
-	mux := chi.NewRouter()
-	mux.NotFound(notFoundHandler)
-	mux.MethodNotAllowed(methodNotAllowedHandler)
+	mux := http.NewServeMux()
 
-	mux.Post("/api/user/register", cfg.Auth.Register)
-	mux.Post("/api/user/login", cfg.Auth.Login)
+	router := &Router{
+		mux:          mux,
+		authenticate: middleware.Auth(cfg.Authenticator),
+	}
 
-	protected := mux.With(middleware.Auth(cfg.Authenticator))
-	protected.Post("/api/user/orders", cfg.Orders.Upload)
-	protected.Get("/api/user/orders", cfg.Orders.List)
-	protected.Get("/api/user/balance", cfg.Balance.Get)
-	protected.Post("/api/user/balance/withdraw", cfg.Balance.Withdraw)
-	protected.Get("/api/user/withdrawals", cfg.Balance.Withdrawals)
+	router.HandleFunc("POST /api/user/register", cfg.Auth.Register)
+	router.HandleFunc("POST /api/user/login", cfg.Auth.Login)
+
+	router.HandleProtected("POST /api/user/orders", cfg.Orders.Upload)
+	router.HandleProtected("GET /api/user/orders", cfg.Orders.List)
+	router.HandleProtected("GET /api/user/balance", cfg.Balance.Get)
+	router.HandleProtected("POST /api/user/balance/withdraw", cfg.Balance.Withdraw)
+	router.HandleProtected("GET /api/user/withdrawals", cfg.Balance.Withdrawals)
 
 	var handler http.Handler = mux
 
@@ -68,11 +67,9 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 	handler = middleware.RequestID(handler)
 	handler = middleware.Recovery(cfg.Logger)(handler)
 
-	return &Router{
-		Router:    mux,
-		handler:   handler,
-		protected: protected,
-	}, nil
+	router.handler = handler
+
+	return router, nil
 }
 
 // validateRouterConfig проверяет обязательные зависимости и параметры
@@ -109,27 +106,22 @@ func validateRouterConfig(cfg RouterConfig) error {
 	return errors.Join(errs...)
 }
 
-// Protected возвращает маршрутизатор группы защищённых маршрутов.
-func (r *Router) Protected() chi.Router {
-	return r.protected
+// Handle регистрирует публичный маршрут.
+func (r *Router) Handle(pattern string, handler http.Handler) {
+	r.mux.Handle(pattern, handler)
+}
+
+// HandleFunc регистрирует публичный маршрут с обработчиком-функцией на тех же
+func (r *Router) HandleFunc(pattern string, handler http.HandlerFunc) {
+	r.mux.Handle(pattern, handler)
+}
+
+// HandleProtected регистрирует маршрут, доступный только с действительным
+func (r *Router) HandleProtected(pattern string, handler http.HandlerFunc) {
+	r.mux.Handle(pattern, r.authenticate(handler))
 }
 
 // ServeHTTP пропускает запрос через цепочку сквозных обработчиков и передаёт
 func (r *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	r.handler.ServeHTTP(w, request)
-}
-
-// notFoundHandler отвечает на запрос к незарегистрированному маршруту.
-func notFoundHandler(w http.ResponseWriter, _ *http.Request) {
-	writeStatus(w, http.StatusNotFound)
-}
-
-// methodNotAllowedHandler отвечает на запрос к зарегистрированному маршруту
-func methodNotAllowedHandler(w http.ResponseWriter, _ *http.Request) {
-	writeStatus(w, http.StatusMethodNotAllowed)
-}
-
-// writeStatus отправляет ответ, состоящий только из кода состояния и его
-func writeStatus(w http.ResponseWriter, status int) {
-	http.Error(w, http.StatusText(status), status)
 }

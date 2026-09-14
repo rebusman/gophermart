@@ -27,6 +27,8 @@ help: ## Показать список целей
 	@echo "  test           юнит-тесты"
 	@echo "  test-race      все тесты с детектором гонок"
 	@echo "  test-integration  интеграционные тесты (нужен PostgreSQL)"
+	@echo "  bench          бенчмарки с учётом выделений памяти"
+	@echo "  fuzz           fuzz-тест алгоритма Луна (FUZZTIME=$(FUZZTIME))"
 	@echo "  cover          отчёт о покрытии тестами"
 	@echo "  tidy           привести go.mod и go.sum в порядок"
 	@echo "  compose-up     поднять PostgreSQL для локальной разработки"
@@ -64,6 +66,19 @@ test-race: ## Все тесты с детектором гонок
 .PHONY: test-integration
 test-integration: ## Интеграционные тесты (нужен PostgreSQL)
 	TEST_DATABASE_URI="$(TEST_DATABASE_URI)" go test -count=1 ./tests/...
+
+# Длительность fuzz-теста. Короткого прогона достаточно для локальной проверки
+# после изменения алгоритма; исходный корпус выполняется и без этой цели, в
+# составе обычного go test.
+FUZZTIME ?= 30s
+
+.PHONY: bench
+bench: ## Бенчмарки с учётом выделений памяти
+	go test -run '^$$' -bench . -benchmem ./...
+
+.PHONY: fuzz
+fuzz: ## Fuzz-тест алгоритма Луна
+	go test -run '^$$' -fuzz FuzzLuhn -fuzztime $(FUZZTIME) ./internal/validator
 
 .PHONY: cover
 cover: ## Отчёт о покрытии тестами

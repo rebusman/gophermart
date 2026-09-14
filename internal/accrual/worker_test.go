@@ -1,13 +1,18 @@
 package accrual_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"gophermart/internal/accrual"
@@ -16,12 +21,16 @@ import (
 
 // Параметры цикла, используемые тестами воркера.
 //
-// Интервалы намеренно малы: тесты проверяют реакцию на события, а не
-// выдержку пауз, и не должны замедлять прогон.
+// Тесты выполняются в пузыре testing/synctest на фиктивных часах, поэтому
+// величина интервалов не влияет на длительность прогона и выбрана близкой к
+// рабочей: проверки опираются на точные значения времени, а не на пороги.
+// Предел одновременных обращений меньше размера порции, чтобы тесты видели и
+// одновременную обработку, и ожидание свободного слота.
 const (
-	workerPollInterval = 10 * time.Millisecond
+	workerPollInterval = time.Second
 	workerLease        = time.Minute
 	workerBatchSize    = 4
+	workerConcurrency  = 2
 )
 
 // errService — произвольный сбой прикладного сценария.
@@ -31,8 +40,8 @@ var errService = errors.New("сбой обработки")
 // воркера.
 //
 // Поведение каждого метода задаётся функцией: тест описывает ровно тот случай,
-// который проверяет. Обращения защищены мьютексом, потому что воркер работает
-// в отдельной goroutine.
+// который проверяет. Обращения защищены мьютексом, потому что задания порции
+// обрабатываются в нескольких goroutine.
 type processingServiceStub struct {
 	mu sync.Mutex
 
@@ -103,6 +112,7 @@ func newWorkerConfig() accrual.WorkerConfig {
 	return accrual.WorkerConfig{
 		PollInterval:  workerPollInterval,
 		BatchSize:     workerBatchSize,
+		Concurrency:   workerConcurrency,
 		LeaseDuration: workerLease,
 	}
 }
@@ -125,13 +135,78 @@ func newJobs(t *testing.T, numbers ...string) []domain.AccrualJob {
 	return jobs
 }
 
-// runWorker запускает воркер в отдельной goroutine и возвращает функцию
-// остановки, дожидающуюся его завершения.
+// claimOnce возвращает выборку, отдающую jobs при первом обращении и пустой
+// результат при последующих.
+//
+// Выборку вызывает только goroutine воркера, поэтому состояние замыкания
+// синхронизации не требует.
+func claimOnce(jobs []domain.AccrualJob) func(context.Context, int, time.Duration) ([]domain.AccrualJob, error) {
+	var handed bool
+
+	return func(context.Context, int, time.Duration) ([]domain.AccrualJob, error) {
+		if handed {
+			return nil, nil
+		}
+
+		handed = true
+
+		return jobs, nil
+	}
+}
+
+// numbersOf возвращает номера заданий.
+func numbersOf(jobs []domain.AccrualJob) []domain.OrderNumber {
+	numbers := make([]domain.OrderNumber, 0, len(jobs))
+
+	for _, job := range jobs {
+		numbers = append(numbers, job.Number)
+	}
+
+	return numbers
+}
+
+// sameNumbers сообщает, совпадают ли наборы номеров без учёта порядка:
+// порядок обработки заданий внутри порции не гарантирован.
+func sameNumbers(got, want []domain.OrderNumber) bool {
+	sorted := func(numbers []domain.OrderNumber) []string {
+		out := make([]string, 0, len(numbers))
+
+		for _, number := range numbers {
+			out = append(out, number.String())
+		}
+
+		slices.Sort(out)
+
+		return out
+	}
+
+	return slices.Equal(sorted(got), sorted(want))
+}
+
+// runWorker запускает воркер с параметрами цикла по умолчанию и логгером,
+// пишущим в logs, и возвращает функцию остановки.
+//
+// Вызывается только внутри synctest.Test с его *testing.T.
 func runWorker(t *testing.T, service accrual.ProcessingService, logs *bytes.Buffer) func() {
 	t.Helper()
 
 	handler := slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})
-	worker := accrual.NewWorker(service, slog.New(handler), newWorkerConfig())
+
+	return startWorker(t, service, slog.New(handler))
+}
+
+// startWorker запускает воркер в отдельной goroutine пузыря и возвращает
+// функцию остановки.
+//
+// Контекст и канал завершения создаются от t пузыря: таймеры и каналы вне
+// пузыря в нём использовать нельзя. Функция остановки отменяет контекст и
+// дожидается, пока все goroutine пузыря заблокируются. Воркер, реагирующий на
+// отмену, к этому моменту уже вернул результат; отсутствие результата означает,
+// что воркер продолжает ждать, не заметив отмены.
+func startWorker(t *testing.T, service accrual.ProcessingService, logger *slog.Logger) func() {
+	t.Helper()
+
+	worker := accrual.NewWorker(service, logger, newWorkerConfig())
 
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
@@ -141,404 +216,613 @@ func runWorker(t *testing.T, service accrual.ProcessingService, logs *bytes.Buff
 	}()
 
 	return func() {
+		t.Helper()
+
 		cancel()
+		synctest.Wait()
 
 		select {
 		case err := <-done:
 			if err != nil {
 				t.Errorf("воркер завершился ошибкой: %v", err)
 			}
-		case <-time.After(2 * time.Second):
+		default:
 			t.Error("воркер не завершился после отмены контекста")
 		}
 	}
 }
 
-// waitTimeout ограничивает ожидание условия в тестах воркера.
-const waitTimeout = 2 * time.Second
-
-// waitFor ожидает выполнения условия, опрашивая его до истечения срока.
-func waitFor(t *testing.T, condition func() bool, message string) {
-	t.Helper()
-
-	deadline := time.Now().Add(waitTimeout)
-
-	for time.Now().Before(deadline) {
-		if condition() {
-			return
-		}
-
-		time.Sleep(time.Millisecond)
-	}
-
-	t.Fatalf("условие не выполнилось за %s: %s", waitTimeout, message)
+// advance продвигает фиктивные часы пузыря на d и дожидается, пока воркер
+// выполнит всё, что стало возможным к этому моменту, и снова заблокируется.
+func advance(d time.Duration) {
+	time.Sleep(d)
+	synctest.Wait()
 }
 
-// TestWorkerProcessesClaimedBatchSequentially закрепляет последовательную
-// обработку порции: каждый заказ обрабатывается ровно один раз, отдельная
-// goroutine на заказ не создаётся.
-func TestWorkerProcessesClaimedBatchSequentially(t *testing.T) {
-	jobs := newJobs(t, "9278923470", "12345678903", "346436439")
+// expectProgress сообщает об ошибке, если число выборок и начатых обработок
+// в указанный момент отличается от ожидаемого.
+//
+// Ошибка не прерывает тест: воркер ещё работает, и тест обязан его остановить,
+// иначе пузырь не завершится.
+func expectProgress(t *testing.T, service *processingServiceStub, claims, processed int, moment string) {
+	t.Helper()
 
-	var (
-		mu       sync.Mutex
-		inFlight int
-		maxSeen  int
-		handed   bool
-	)
+	gotClaims, gotProcessed, _ := service.snapshot()
+	if gotClaims != claims || len(gotProcessed) != processed {
+		t.Errorf("%s: выборок %d, обработок %d; ожидалось %d и %d",
+			moment, gotClaims, len(gotProcessed), claims, processed)
+	}
+}
 
-	service := &processingServiceStub{
-		claim: func(context.Context, int, time.Duration) ([]domain.AccrualJob, error) {
-			mu.Lock()
-			defer mu.Unlock()
+// expectReleased сообщает об ошибке, если освобождение выполнено не одним
+// вызовом, не для указанного набора заказов или с другой отсрочкой.
+func expectReleased(t *testing.T, service *processingServiceStub, delay time.Duration, want ...domain.OrderNumber) {
+	t.Helper()
 
-			if handed {
-				return nil, nil
-			}
+	service.mu.Lock()
+	defer service.mu.Unlock()
 
-			handed = true
-
-			return jobs, nil
-		},
-		process: func(context.Context, domain.AccrualJob) error {
-			mu.Lock()
-			inFlight++
-
-			if inFlight > maxSeen {
-				maxSeen = inFlight
-			}
-
-			mu.Unlock()
-
-			time.Sleep(2 * time.Millisecond)
-
-			mu.Lock()
-			inFlight--
-			mu.Unlock()
-
-			return nil
-		},
+	if service.releaseCalls != 1 {
+		t.Errorf("освобождений: %d, ожидалось 1", service.releaseCalls)
 	}
 
-	stop := runWorker(t, service, &bytes.Buffer{})
-
-	waitFor(t, func() bool {
-		_, processed, _ := service.snapshot()
-
-		return len(processed) == len(jobs)
-	}, "порция не обработана целиком")
-
-	stop()
-
-	_, processed, _ := service.snapshot()
-
-	if len(processed) != len(jobs) {
-		t.Fatalf("обработано заказов: %d, ожидалось %d", len(processed), len(jobs))
+	if service.releaseDelay != delay {
+		t.Errorf("неожиданная отсрочка освобождения: got %s, want %s", service.releaseDelay, delay)
 	}
 
-	for i, job := range jobs {
-		if processed[i] != job.Number {
-			t.Errorf("нарушен порядок обработки: позиция %d содержит %s, ожидался %s",
-				i, processed[i], job.Number)
+	if !sameNumbers(service.released, want) {
+		t.Errorf("освобождён неожиданный остаток порции: got %v, want %v", service.released, want)
+	}
+}
+
+// findLogRecord возвращает первую запись JSON-журнала с указанным сообщением.
+func findLogRecord(t *testing.T, logs *bytes.Buffer, message string) map[string]any {
+	t.Helper()
+
+	scanner := bufio.NewScanner(bytes.NewReader(logs.Bytes()))
+	scanner.Buffer(nil, 1<<20)
+
+	for scanner.Scan() {
+		var record map[string]any
+		if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
+			t.Fatalf("запись журнала не является JSON: %v (%s)", err, scanner.Text())
+		}
+
+		if record["msg"] == message {
+			return record
 		}
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	if maxSeen > 1 {
-		t.Errorf("порция обработана параллельно: одновременно в работе %d заказов", maxSeen)
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("чтение журнала: %v", err)
 	}
+
+	t.Fatalf("в журнале нет записи %q: %s", message, logs.String())
+
+	return nil
+}
+
+// TestWorkerProcessesEachJobOnce закрепляет, что каждое задание порции
+// обрабатывается ровно один раз, при произвольном порядке обработки.
+func TestWorkerProcessesEachJobOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		jobs := newJobs(t, "9278923470", "12345678903", "346436439")
+
+		service := &processingServiceStub{claim: claimOnce(jobs)}
+
+		stop := runWorker(t, service, &bytes.Buffer{})
+
+		// Второй цикл получает пустую выборку и не должен повторить обработку.
+		advance(workerPollInterval)
+
+		claims, processed, _ := service.snapshot()
+
+		stop()
+
+		if claims != 2 {
+			t.Errorf("выборок за два цикла: %d, ожидалось 2", claims)
+		}
+
+		if !sameNumbers(processed, numbersOf(jobs)) {
+			t.Errorf("обработаны не все задания порции либо не по одному разу: got %v, want %v",
+				processed, numbersOf(jobs))
+		}
+	})
+}
+
+// TestWorkerRespectsConcurrencyLimit закрепляет сценарий «Предел
+// одновременных обращений соблюдается»: одновременно выполняется ровно столько
+// обработок, сколько разрешает предел, а следующая начинается только после
+// завершения одной из выполняющихся.
+func TestWorkerRespectsConcurrencyLimit(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		jobs := newJobs(t, "9278923470", "12345678903", "346436439")
+
+		const processDelay = 100 * time.Millisecond
+
+		var (
+			mu       sync.Mutex
+			inFlight int
+			maxSeen  int
+		)
+
+		service := &processingServiceStub{
+			claim: claimOnce(jobs),
+			process: func(context.Context, domain.AccrualJob) error {
+				mu.Lock()
+				inFlight++
+				maxSeen = max(maxSeen, inFlight)
+				mu.Unlock()
+
+				time.Sleep(processDelay)
+
+				mu.Lock()
+				inFlight--
+				mu.Unlock()
+
+				return nil
+			},
+		}
+
+		stop := runWorker(t, service, &bytes.Buffer{})
+
+		synctest.Wait()
+		expectProgress(t, service, 1, workerConcurrency, "сразу после выборки")
+
+		advance(processDelay - time.Nanosecond)
+		expectProgress(t, service, 1, workerConcurrency, "до завершения первых обработок")
+
+		advance(time.Nanosecond)
+		expectProgress(t, service, 1, len(jobs), "после завершения первых обработок")
+
+		advance(processDelay)
+
+		stop()
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		if maxSeen != workerConcurrency {
+			t.Errorf("одновременно выполнялось обработок: %d, ожидалось ровно %d", maxSeen, workerConcurrency)
+		}
+	})
 }
 
 // TestWorkerRespectsBatchSize закрепляет, что за один цикл запрашивается не
 // больше заданий, чем задано размером порции.
 func TestWorkerRespectsBatchSize(t *testing.T) {
-	var gotBatch, gotLease = 0, time.Duration(0)
+	synctest.Test(t, func(t *testing.T) {
+		var gotBatch, gotLease = 0, time.Duration(0)
 
-	service := &processingServiceStub{
-		claim: func(_ context.Context, batchSize int, lease time.Duration) ([]domain.AccrualJob, error) {
-			gotBatch = batchSize
-			gotLease = lease
+		service := &processingServiceStub{
+			claim: func(_ context.Context, batchSize int, lease time.Duration) ([]domain.AccrualJob, error) {
+				gotBatch = batchSize
+				gotLease = lease
 
-			return nil, nil
-		},
-	}
+				return nil, nil
+			},
+		}
 
-	stop := runWorker(t, service, &bytes.Buffer{})
+		stop := runWorker(t, service, &bytes.Buffer{})
 
-	waitFor(t, func() bool {
+		synctest.Wait()
+
 		claims, _, _ := service.snapshot()
 
-		return claims > 0
-	}, "выборка заданий не выполнялась")
+		stop()
 
-	stop()
+		if claims != 1 {
+			t.Fatalf("выборок заданий в первом цикле: %d, ожидалась 1", claims)
+		}
 
-	if gotBatch != workerBatchSize {
-		t.Errorf("неожиданный размер порции: got %d, want %d", gotBatch, workerBatchSize)
-	}
+		if gotBatch != workerBatchSize {
+			t.Errorf("неожиданный размер порции: got %d, want %d", gotBatch, workerBatchSize)
+		}
 
-	if gotLease != workerLease {
-		t.Errorf("неожиданный срок аренды: got %s, want %s", gotLease, workerLease)
-	}
+		if gotLease != workerLease {
+			t.Errorf("неожиданный срок аренды: got %s, want %s", gotLease, workerLease)
+		}
+	})
 }
 
-// TestWorkerPausesOnRateLimitAndReleasesRemainder закрепляет требование
-// «Превышение лимита запросов приостанавливает опрос целиком»: после отказа
-// новых обращений нет, а остаток порции освобождён.
+// TestWorkerWaitsPollIntervalBetweenCycles закрепляет интервал опроса: после
+// пустой выборки следующая выполняется ровно через интервал, не раньше.
+func TestWorkerWaitsPollIntervalBetweenCycles(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		service := &processingServiceStub{}
+
+		stop := runWorker(t, service, &bytes.Buffer{})
+
+		synctest.Wait()
+		expectProgress(t, service, 1, 0, "сразу после запуска")
+
+		advance(workerPollInterval - time.Nanosecond)
+		expectProgress(t, service, 1, 0, "до истечения интервала опроса")
+
+		advance(time.Nanosecond)
+		expectProgress(t, service, 2, 0, "по истечении интервала опроса")
+
+		stop()
+	})
+}
+
+// TestWorkerPausesOnRateLimitAndReleasesRemainder закрепляет сценарии
+// «Превышен лимит запросов» и «Лимит превышен при одновременной обработке
+// порции»: выполняющееся обращение завершается, не начатые заказы не
+// обрабатываются, не начатые и отклонённые освобождаются, а новых обращений
+// нет ровно до истечения указанного времени.
 func TestWorkerPausesOnRateLimitAndReleasesRemainder(t *testing.T) {
-	jobs := newJobs(t, "9278923470", "12345678903", "346436439")
+	synctest.Test(t, func(t *testing.T) {
+		jobs := newJobs(t, "9278923470", "12345678903", "346436439", "4561261212345467")
 
-	const pause = 300 * time.Millisecond
+		// Обе обработки начинаются одновременно, отказ по лимиту приходит
+		// раньше, чем завершается медленное обращение. Пауза отличается от
+		// интервала опроса: иначе тест не отличил бы приостановку от
+		// обычного ожидания следующего цикла.
+		const (
+			rejectDelay  = 10 * time.Millisecond
+			processDelay = 100 * time.Millisecond
+			pause        = 30 * time.Second
+		)
 
-	var handed bool
+		var completed atomic.Bool
 
-	service := &processingServiceStub{
-		claim: func(context.Context, int, time.Duration) ([]domain.AccrualJob, error) {
-			if handed {
-				return nil, nil
-			}
+		service := &processingServiceStub{
+			claim: claimOnce(jobs),
+			process: func(ctx context.Context, job domain.AccrualJob) error {
+				if job.Number != jobs[0].Number {
+					time.Sleep(rejectDelay)
 
-			handed = true
+					return &domain.RateLimitError{RetryAfter: pause}
+				}
 
-			return jobs, nil
-		},
-		process: func(_ context.Context, job domain.AccrualJob) error {
-			if job.Number == jobs[0].Number {
+				time.Sleep(processDelay)
+				completed.Store(ctx.Err() == nil)
+
 				return nil
-			}
+			},
+		}
 
-			return &domain.RateLimitError{RetryAfter: pause}
-		},
-	}
+		stop := runWorker(t, service, &bytes.Buffer{})
 
-	stop := runWorker(t, service, &bytes.Buffer{})
+		synctest.Wait()
+		expectProgress(t, service, 1, workerConcurrency, "сразу после выборки")
 
-	waitFor(t, func() bool {
-		_, _, releases := service.snapshot()
+		advance(rejectDelay)
+		expectProgress(t, service, 1, workerConcurrency, "после отказа по лимиту")
 
-		return releases > 0
-	}, "остаток порции не освобождён")
+		if _, _, releases := service.snapshot(); releases != 0 {
+			t.Errorf("освобождение выполнено до завершения выполняющегося обращения: освобождений %d", releases)
+		}
 
-	// Во время паузы обработка не продолжается: третий заказ не тронут.
-	time.Sleep(pause / 3)
+		advance(processDelay - rejectDelay)
+		expectProgress(t, service, 1, workerConcurrency, "после завершения выполняющегося обращения")
+		expectReleased(t, service, pause, jobs[1].Number, jobs[2].Number, jobs[3].Number)
 
-	_, processed, _ := service.snapshot()
+		if !completed.Load() {
+			t.Error("выполняющееся обращение прервано приостановкой")
+		}
 
-	stop()
+		advance(pause - time.Nanosecond)
+		expectProgress(t, service, 1, workerConcurrency, "до истечения паузы")
 
-	if len(processed) != 2 {
-		t.Errorf("обработка продолжилась во время паузы: обработано %d заказов", len(processed))
-	}
+		advance(time.Nanosecond)
+		expectProgress(t, service, 2, workerConcurrency, "по истечении паузы")
 
-	service.mu.Lock()
-	defer service.mu.Unlock()
+		stop()
+	})
+}
 
-	if len(service.released) != 2 {
-		t.Fatalf("освобождено заданий: %d, ожидалось 2", len(service.released))
-	}
+// TestWorkerPausesForLongestRetryAfter закрепляет сценарий «Несколько отказов
+// по лимиту в одной порции»: обращения возобновляются не раньше истечения
+// наибольшего из указанных времён, даже если он пришёл первым.
+func TestWorkerPausesForLongestRetryAfter(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		jobs := newJobs(t, "9278923470", "12345678903")
 
-	if service.released[0] != jobs[1].Number || service.released[1] != jobs[2].Number {
-		t.Errorf("освобождён неожиданный остаток порции: %v", service.released)
-	}
+		const (
+			longPause  = 30 * time.Second
+			shortPause = 10 * time.Second
+			firstReply = 100 * time.Millisecond
+			lastReply  = 200 * time.Millisecond
+		)
 
-	if service.releaseDelay != pause {
-		t.Errorf("неожиданная отсрочка освобождения: got %s, want %s", service.releaseDelay, pause)
-	}
+		service := &processingServiceStub{
+			claim: claimOnce(jobs),
+			process: func(_ context.Context, job domain.AccrualJob) error {
+				if job.Number == jobs[0].Number {
+					time.Sleep(firstReply)
+
+					return &domain.RateLimitError{RetryAfter: longPause}
+				}
+
+				time.Sleep(lastReply)
+
+				return &domain.RateLimitError{RetryAfter: shortPause}
+			},
+		}
+
+		stop := runWorker(t, service, &bytes.Buffer{})
+
+		advance(lastReply)
+		expectProgress(t, service, 1, len(jobs), "после обоих отказов")
+		expectReleased(t, service, longPause, numbersOf(jobs)...)
+
+		advance(longPause - time.Nanosecond)
+		expectProgress(t, service, 1, len(jobs), "до истечения наибольшей паузы")
+
+		advance(time.Nanosecond)
+		expectProgress(t, service, 2, len(jobs), "по истечении наибольшей паузы")
+
+		stop()
+	})
 }
 
 // TestWorkerStopsPromptlyWhileWaiting закрепляет сценарий «Остановка во время
 // ожидания следующего цикла»: воркер возвращает управление, не досиживая паузу.
 func TestWorkerStopsPromptlyWhileWaiting(t *testing.T) {
-	// Интервал заведомо больше отведённого на остановку времени: если бы
-	// ожидание не прерывалось, тест не уложился бы в срок.
-	worker := accrual.NewWorker(&processingServiceStub{}, slog.New(slog.DiscardHandler), accrual.WorkerConfig{
-		PollInterval:  30 * time.Second,
-		BatchSize:     workerBatchSize,
-		LeaseDuration: workerLease,
-	})
+	synctest.Test(t, func(t *testing.T) {
+		stop := startWorker(t, &processingServiceStub{}, slog.New(slog.DiscardHandler))
 
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
+		// Воркер выполнил первую выборку и ждёт следующего цикла.
+		synctest.Wait()
 
-	go func() {
-		done <- worker.Run(ctx)
-	}()
+		start := time.Now()
 
-	// Даём воркеру дойти до ожидания.
-	time.Sleep(20 * time.Millisecond)
+		stop()
 
-	start := time.Now()
-
-	cancel()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("воркер завершился ошибкой: %v", err)
+		// Часы пузыря продвигаются только ожиданием таймеров: ненулевое время
+		// означало бы, что остановка дождалась окончания интервала опроса.
+		if elapsed := time.Since(start); elapsed != 0 {
+			t.Errorf("остановка заняла %s: ожидание не прерывается отменой", elapsed)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("воркер не прервал ожидание следующего цикла")
-	}
-
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Errorf("остановка заняла %s: ожидание не прерывается отменой", elapsed)
-	}
+	})
 }
 
 // TestWorkerStopsPromptlyDuringPause закрепляет прерывание паузы по лимиту
 // запросов: остановка сервиса не должна ждать её окончания.
 func TestWorkerStopsPromptlyDuringPause(t *testing.T) {
-	jobs := newJobs(t, "9278923470")
+	synctest.Test(t, func(t *testing.T) {
+		jobs := newJobs(t, "9278923470")
 
-	service := &processingServiceStub{
-		claim: func(context.Context, int, time.Duration) ([]domain.AccrualJob, error) {
-			return jobs, nil
-		},
-		process: func(context.Context, domain.AccrualJob) error {
-			return &domain.RateLimitError{RetryAfter: 30 * time.Second}
-		},
-	}
-
-	worker := accrual.NewWorker(service, slog.New(slog.DiscardHandler), newWorkerConfig())
-
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-
-	go func() {
-		done <- worker.Run(ctx)
-	}()
-
-	waitFor(t, func() bool {
-		_, _, releases := service.snapshot()
-
-		return releases > 0
-	}, "воркер не дошёл до паузы")
-
-	start := time.Now()
-
-	cancel()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("воркер завершился ошибкой: %v", err)
+		service := &processingServiceStub{
+			claim: func(context.Context, int, time.Duration) ([]domain.AccrualJob, error) {
+				return jobs, nil
+			},
+			process: func(context.Context, domain.AccrualJob) error {
+				return &domain.RateLimitError{RetryAfter: 30 * time.Second}
+			},
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("воркер не прервал паузу по лимиту запросов")
-	}
 
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Errorf("остановка заняла %s: пауза не прерывается отменой", elapsed)
-	}
+		stop := startWorker(t, service, slog.New(slog.DiscardHandler))
+
+		synctest.Wait()
+
+		if _, _, releases := service.snapshot(); releases != 1 {
+			t.Fatalf("воркер не дошёл до паузы: освобождений %d", releases)
+		}
+
+		start := time.Now()
+
+		stop()
+
+		if elapsed := time.Since(start); elapsed != 0 {
+			t.Errorf("остановка заняла %s: пауза не прерывается отменой", elapsed)
+		}
+	})
+}
+
+// TestWorkerStopsDuringConcurrentProcessing закрепляет сценарий «Остановка во
+// время обращения к внешней системе» при одновременной обработке: отмена
+// прерывает все выполняющиеся обработки, остаток порции не освобождается —
+// его вернёт истечение аренды, — а воркер завершается без ошибки.
+func TestWorkerStopsDuringConcurrentProcessing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		jobs := newJobs(t, "9278923470", "12345678903", "346436439")
+
+		var interrupted atomic.Int32
+
+		service := &processingServiceStub{
+			claim: claimOnce(jobs),
+			process: func(ctx context.Context, _ domain.AccrualJob) error {
+				<-ctx.Done()
+				interrupted.Add(1)
+
+				return ctx.Err()
+			},
+		}
+
+		stop := startWorker(t, service, slog.New(slog.DiscardHandler))
+
+		synctest.Wait()
+		expectProgress(t, service, 1, workerConcurrency, "до остановки")
+
+		start := time.Now()
+
+		stop()
+
+		if elapsed := time.Since(start); elapsed != 0 {
+			t.Errorf("остановка заняла %s: выполняющиеся обработки не прерываются", elapsed)
+		}
+
+		if got := interrupted.Load(); got != workerConcurrency {
+			t.Errorf("прервано обработок: %d, ожидалось %d", got, workerConcurrency)
+		}
+
+		expectProgress(t, service, 1, workerConcurrency, "после остановки")
+
+		if _, _, releases := service.snapshot(); releases != 0 {
+			t.Errorf("остановка освободила задания: освобождений %d", releases)
+		}
+	})
 }
 
 // TestWorkerSurvivesClaimFailure закрепляет устойчивость цикла: сбой выборки
 // не завершает воркер, потому что база может быть временно недоступна.
 func TestWorkerSurvivesClaimFailure(t *testing.T) {
-	var attempts int
+	synctest.Test(t, func(t *testing.T) {
+		var attempts int
 
-	service := &processingServiceStub{
-		claim: func(context.Context, int, time.Duration) ([]domain.AccrualJob, error) {
-			attempts++
+		service := &processingServiceStub{
+			claim: func(context.Context, int, time.Duration) ([]domain.AccrualJob, error) {
+				attempts++
 
-			if attempts < 3 {
-				return nil, errService
-			}
+				if attempts < 3 {
+					return nil, errService
+				}
 
-			return nil, nil
-		},
-	}
+				return nil, nil
+			},
+		}
 
-	logs := &bytes.Buffer{}
-	stop := runWorker(t, service, logs)
+		logs := &bytes.Buffer{}
+		stop := runWorker(t, service, logs)
 
-	waitFor(t, func() bool {
+		// Первая выборка — при запуске, затем по одной на каждый интервал:
+		// за три интервала выполняются четыре выборки, из них две неудачные.
+		advance(3 * workerPollInterval)
+
 		claims, _, _ := service.snapshot()
 
-		return claims >= 4
-	}, "цикл прервался после сбоя выборки")
+		stop()
 
-	stop()
+		if claims != 4 {
+			t.Errorf("цикл прервался после сбоя выборки: выборок %d, ожидалось 4", claims)
+		}
 
-	if !strings.Contains(logs.String(), "выборка заданий расчёта не выполнена") {
-		t.Error("сбой выборки не записан в журнал")
-	}
+		if !strings.Contains(logs.String(), "выборка заданий расчёта не выполнена") {
+			t.Error("сбой выборки не записан в журнал")
+		}
+	})
 }
 
 // TestWorkerSurvivesProcessFailure закрепляет, что сбой обработки одного
 // заказа не прерывает обработку остальных.
 func TestWorkerSurvivesProcessFailure(t *testing.T) {
-	jobs := newJobs(t, "9278923470", "12345678903", "346436439")
+	synctest.Test(t, func(t *testing.T) {
+		jobs := newJobs(t, "9278923470", "12345678903", "346436439")
 
-	var handed bool
+		service := &processingServiceStub{
+			claim: claimOnce(jobs),
+			process: func(_ context.Context, job domain.AccrualJob) error {
+				if job.Number == jobs[0].Number {
+					return errService
+				}
 
-	service := &processingServiceStub{
-		claim: func(context.Context, int, time.Duration) ([]domain.AccrualJob, error) {
-			if handed {
-				return nil, nil
-			}
+				return nil
+			},
+		}
 
-			handed = true
+		logs := &bytes.Buffer{}
+		stop := runWorker(t, service, logs)
 
-			return jobs, nil
-		},
-		process: func(_ context.Context, job domain.AccrualJob) error {
-			if job.Number == jobs[0].Number {
-				return errService
-			}
+		synctest.Wait()
 
-			return nil
-		},
-	}
-
-	logs := &bytes.Buffer{}
-	stop := runWorker(t, service, logs)
-
-	waitFor(t, func() bool {
 		_, processed, _ := service.snapshot()
 
-		return len(processed) == len(jobs)
-	}, "обработка порции прервалась после сбоя одного заказа")
+		stop()
 
-	stop()
+		if len(processed) != len(jobs) {
+			t.Errorf("обработка порции прервалась после сбоя одного заказа: обработано %d из %d",
+				len(processed), len(jobs))
+		}
 
-	if !strings.Contains(logs.String(), "обработка заказа не выполнена") {
-		t.Error("сбой обработки не записан в журнал")
-	}
+		if !strings.Contains(logs.String(), "обработка заказа не выполнена") {
+			t.Error("сбой обработки не записан в журнал")
+		}
+	})
+}
+
+// TestWorkerSurvivesPanicInJob закрепляет сценарий «Аварийное завершение
+// обработки одного заказа»: остальные заказы порции обработаны, фоновый
+// процесс продолжает циклы, в журнал записаны номер заказа и стек, а задание
+// не освобождено — его вернёт истечение аренды.
+func TestWorkerSurvivesPanicInJob(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		jobs := newJobs(t, "9278923470", "12345678903", "346436439")
+
+		const panicMessage = "падение обработки заказа"
+
+		service := &processingServiceStub{
+			claim: claimOnce(jobs),
+			process: func(_ context.Context, job domain.AccrualJob) error {
+				if job.Number == jobs[0].Number {
+					panic(panicMessage)
+				}
+
+				return nil
+			},
+		}
+
+		logs := &bytes.Buffer{}
+		stop := runWorker(t, service, logs)
+
+		synctest.Wait()
+		expectProgress(t, service, 1, len(jobs), "после паники при обработке одного заказа")
+
+		advance(workerPollInterval)
+		expectProgress(t, service, 2, len(jobs), "в следующем цикле после паники")
+
+		stop()
+
+		if _, _, releases := service.snapshot(); releases != 0 {
+			t.Errorf("задание после паники освобождено: освобождений %d", releases)
+		}
+
+		record := findLogRecord(t, logs, "panic при обработке заказа")
+
+		if record["level"] != slog.LevelError.String() {
+			t.Errorf("уровень записи о панике: got %v, want %s", record["level"], slog.LevelError)
+		}
+
+		if record["panic"] != panicMessage {
+			t.Errorf("в записи нет значения паники: %v", record["panic"])
+		}
+
+		if record["order"] != jobs[0].Number.String() {
+			t.Errorf("в записи нет номера заказа: got %v, want %s", record["order"], jobs[0].Number)
+		}
+
+		if stack, ok := record["stack"].(string); !ok || stack == "" {
+			t.Error("в записи нет стека вызовов")
+		}
+	})
 }
 
 // TestWorkerLogsDoNotLeakSecrets закрепляет требование безопасности: журнал
 // воркера не содержит адреса внешней системы и строки подключения.
 func TestWorkerLogsDoNotLeakSecrets(t *testing.T) {
-	jobs := newJobs(t, "9278923470")
+	synctest.Test(t, func(t *testing.T) {
+		jobs := newJobs(t, "9278923470")
 
-	service := &processingServiceStub{
-		claim: func(context.Context, int, time.Duration) ([]domain.AccrualJob, error) {
-			return jobs, nil
-		},
-		process: func(context.Context, domain.AccrualJob) error {
-			return errService
-		},
-	}
+		service := &processingServiceStub{
+			claim: func(context.Context, int, time.Duration) ([]domain.AccrualJob, error) {
+				return jobs, nil
+			},
+			process: func(context.Context, domain.AccrualJob) error {
+				return errService
+			},
+		}
 
-	logs := &bytes.Buffer{}
-	stop := runWorker(t, service, logs)
+		logs := &bytes.Buffer{}
+		stop := runWorker(t, service, logs)
 
-	waitFor(t, func() bool {
+		synctest.Wait()
+
 		_, processed, _ := service.snapshot()
 
-		return len(processed) > 0
-	}, "заказ не обработан")
+		stop()
 
-	stop()
-
-	for _, secret := range []string{"password", "postgres://", "JWT_SECRET", "Authorization"} {
-		if strings.Contains(logs.String(), secret) {
-			t.Errorf("журнал содержит %q", secret)
+		if len(processed) != 1 {
+			t.Fatalf("обработано заказов: %d, ожидался 1", len(processed))
 		}
-	}
+
+		for _, secret := range []string{"password", "postgres://", "JWT_SECRET", "Authorization"} {
+			if strings.Contains(logs.String(), secret) {
+				t.Errorf("журнал содержит %q", secret)
+			}
+		}
+	})
 }
 
 // TestWorkerConfigValidate закрепляет отказ на параметрах, при которых цикл не
@@ -551,10 +835,16 @@ func TestWorkerConfigValidate(t *testing.T) {
 	}
 
 	tests := map[string]accrual.WorkerConfig{
-		"нулевой интервал":     {PollInterval: 0, BatchSize: 1, LeaseDuration: time.Minute},
-		"нулевая порция":       {PollInterval: time.Second, BatchSize: 0, LeaseDuration: time.Minute},
-		"нулевая аренда":       {PollInterval: time.Second, BatchSize: 1, LeaseDuration: 0},
-		"отрицательный размер": {PollInterval: time.Second, BatchSize: -1, LeaseDuration: time.Minute},
+		"нулевой интервал": {PollInterval: 0, BatchSize: 1, Concurrency: 1, LeaseDuration: time.Minute},
+		"нулевая порция":   {PollInterval: time.Second, BatchSize: 0, Concurrency: 1, LeaseDuration: time.Minute},
+		"нулевая аренда":   {PollInterval: time.Second, BatchSize: 1, Concurrency: 1, LeaseDuration: 0},
+		"отрицательный размер": {
+			PollInterval: time.Second, BatchSize: -1, Concurrency: 1, LeaseDuration: time.Minute,
+		},
+		"нулевой предел": {PollInterval: time.Second, BatchSize: 1, Concurrency: 0, LeaseDuration: time.Minute},
+		"отрицательный предел": {
+			PollInterval: time.Second, BatchSize: 1, Concurrency: -1, LeaseDuration: time.Minute,
+		},
 	}
 
 	for name, cfg := range tests {

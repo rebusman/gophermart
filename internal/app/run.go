@@ -97,6 +97,7 @@ func newAccrualWorker(cfg Config, logger *slog.Logger, pool *pgxpool.Pool) (*acc
 	workerCfg := accrual.WorkerConfig{
 		PollInterval:  cfg.AccrualPollInterval,
 		BatchSize:     cfg.AccrualBatchSize,
+		Concurrency:   cfg.AccrualConcurrency,
 		LeaseDuration: cfg.AccrualLeaseDuration,
 	}
 

@@ -287,12 +287,28 @@ func TestAccrualDefaultsApplyWithoutAnyEnvironment(t *testing.T) {
 		t.Errorf("размер порции: got %d, want %d", cfg.AccrualBatchSize, app.DefaultAccrualBatchSize)
 	}
 
-	// Соотношение, от которого зависит осмысленность аренды, обязано
-	// выполняться уже на значениях по умолчанию.
-	if cfg.AccrualLeaseDuration <= cfg.AccrualRequestTimeout {
-		t.Errorf("срок аренды по умолчанию %s не превышает время обращения %s",
-			cfg.AccrualLeaseDuration, cfg.AccrualRequestTimeout)
+	if cfg.AccrualConcurrency != app.DefaultAccrualConcurrency {
+		t.Errorf("предел одновременных обращений: got %d, want %d",
+			cfg.AccrualConcurrency, app.DefaultAccrualConcurrency)
 	}
+
+	// Соотношение, от которого зависит осмысленность аренды, обязано
+	// выполняться уже на значениях по умолчанию: аренда перекрывает худшее
+	// время обработки порции.
+	if batch := worstBatchDuration(cfg); cfg.AccrualLeaseDuration <= batch {
+		t.Errorf("срок аренды по умолчанию %s не превышает худшее время обработки порции %s",
+			cfg.AccrualLeaseDuration, batch)
+	}
+}
+
+// worstBatchDuration вычисляет худшее время обработки порции по формуле
+// спецификации независимо от реализации: число заданий порции, делённое на
+// предел одновременных обращений с округлением вверх, умноженное на
+// предельное время обращения.
+func worstBatchDuration(cfg app.Config) time.Duration {
+	waves := (cfg.AccrualBatchSize + cfg.AccrualConcurrency - 1) / cfg.AccrualConcurrency
+
+	return time.Duration(waves) * cfg.AccrualRequestTimeout
 }
 
 // TestAccrualParametersFromEnvironment закрепляет чтение каждого параметра
@@ -306,6 +322,7 @@ func TestAccrualParametersFromEnvironment(t *testing.T) {
 	env[app.EnvAccrualBackoffCap] = "9m"
 	env[app.EnvAccrualRetryAfter] = "45s"
 	env[app.EnvAccrualBatchSize] = "7"
+	env[app.EnvAccrualConcurrency] = "3"
 
 	cfg, err := app.LoadConfig(nil, envOf(env))
 	if err != nil {
@@ -333,6 +350,10 @@ func TestAccrualParametersFromEnvironment(t *testing.T) {
 	if cfg.AccrualBatchSize != 7 {
 		t.Errorf("%s: got %d, want 7", app.EnvAccrualBatchSize, cfg.AccrualBatchSize)
 	}
+
+	if cfg.AccrualConcurrency != 3 {
+		t.Errorf("%s: got %d, want 3", app.EnvAccrualConcurrency, cfg.AccrualConcurrency)
+	}
 }
 
 // TestAccrualParametersRejectMalformedValues закрепляет отказ на значениях,
@@ -341,6 +362,7 @@ func TestAccrualParametersRejectMalformedValues(t *testing.T) {
 	tests := map[string]string{
 		app.EnvAccrualPollInterval: "быстро",
 		app.EnvAccrualBatchSize:    "много",
+		app.EnvAccrualConcurrency:  "несколько",
 	}
 
 	for key, value := range tests {
@@ -355,58 +377,88 @@ func TestAccrualParametersRejectMalformedValues(t *testing.T) {
 	}
 }
 
-// TestAccrualLeaseMustExceedRequestTimeout закрепляет ключевое соотношение:
-// аренда задания обязана переживать обращение к внешней системе, иначе тот же
-// заказ возьмёт другой экземпляр, пока вызов ещё выполняется.
-func TestAccrualLeaseMustExceedRequestTimeout(t *testing.T) {
+// TestAccrualLeaseMustCoverBatch закрепляет сценарий «Недостаточный срок
+// аренды отвергается при запуске»: аренда выдаётся всей порции в момент
+// выборки и обязана перекрывать худшее время её обработки, а не одно
+// обращение. Сообщение называет срок аренды и худшее время порции.
+func TestAccrualLeaseMustCoverBatch(t *testing.T) {
+	const timeout = "5s"
+
 	tests := []struct {
-		name    string
-		lease   string
-		timeout string
-		wantErr bool
+		name        string
+		batch       string
+		concurrency string
+		lease       string
+		worstBatch  string
+		wantErr     bool
 	}{
-		{name: "аренда короче обращения", lease: "3s", timeout: "5s", wantErr: true},
-		{name: "аренда равна обращению", lease: "5s", timeout: "5s", wantErr: true},
-		{name: "аренда длиннее обращения", lease: "6s", timeout: "5s", wantErr: false},
+		{name: "аренда короче порции", batch: "8", concurrency: "4", lease: "9s", worstBatch: "10s", wantErr: true},
+		{name: "аренда равна порции", batch: "8", concurrency: "4", lease: "10s", worstBatch: "10s", wantErr: true},
+		{name: "аренда длиннее порции", batch: "8", concurrency: "4", lease: "11s"},
+		{
+			name:  "неполная волна округляется вверх",
+			batch: "9", concurrency: "4", lease: "14s", worstBatch: "15s", wantErr: true,
+		},
+		{name: "аренда перекрывает округлённую порцию", batch: "9", concurrency: "4", lease: "16s"},
+		{name: "предел больше порции", batch: "2", concurrency: "8", lease: "5s", worstBatch: "5s", wantErr: true},
+		{name: "последовательная порция", batch: "4", concurrency: "1", lease: "20s", worstBatch: "20s", wantErr: true},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			env := requiredEnv()
+			env[app.EnvAccrualBatchSize] = test.batch
+			env[app.EnvAccrualConcurrency] = test.concurrency
 			env[app.EnvAccrualLeaseDuration] = test.lease
-			env[app.EnvAccrualRequestTimeout] = test.timeout
+			env[app.EnvAccrualRequestTimeout] = timeout
 
 			_, err := app.LoadConfig(nil, envOf(env))
 
-			if test.wantErr && err == nil {
-				t.Error("нарушенное соотношение аренды и таймаута принято")
+			if !test.wantErr {
+				if err != nil {
+					t.Errorf("срок аренды, перекрывающий порцию, отвергнут: %v", err)
+				}
+
+				return
 			}
 
-			if !test.wantErr && err != nil {
-				t.Errorf("корректное соотношение отвергнуто: %v", err)
+			if err == nil {
+				t.Fatal("срок аренды, не перекрывающий порцию, принят")
+			}
+
+			for _, part := range []string{app.EnvAccrualLeaseDuration, test.lease, test.worstBatch} {
+				if !strings.Contains(err.Error(), part) {
+					t.Errorf("сообщение не содержит %q: %v", part, err)
+				}
 			}
 		})
 	}
 }
 
 // TestAccrualParametersRejectNonPositiveValues закрепляет отказ на
-// неположительных значениях: цикл с нулевым интервалом или нулевой порцией
+// неположительных значениях и сценарий «Недопустимый предел одновременных
+// обращений»: цикл с нулевым интервалом, нулевой порцией или нулевым пределом
 // не имеет смысла.
 func TestAccrualParametersRejectNonPositiveValues(t *testing.T) {
-	tests := map[string]string{
-		app.EnvAccrualPollInterval: "0s",
-		app.EnvAccrualBackoffBase:  "-1s",
-		app.EnvAccrualRetryAfter:   "0s",
-		app.EnvAccrualBatchSize:    "0",
+	tests := []struct {
+		key   string
+		value string
+	}{
+		{key: app.EnvAccrualPollInterval, value: "0s"},
+		{key: app.EnvAccrualBackoffBase, value: "-1s"},
+		{key: app.EnvAccrualRetryAfter, value: "0s"},
+		{key: app.EnvAccrualBatchSize, value: "0"},
+		{key: app.EnvAccrualConcurrency, value: "0"},
+		{key: app.EnvAccrualConcurrency, value: "-1"},
 	}
 
-	for key, value := range tests {
-		t.Run(key, func(t *testing.T) {
+	for _, test := range tests {
+		t.Run(test.key+"="+test.value, func(t *testing.T) {
 			env := requiredEnv()
-			env[key] = value
+			env[test.key] = test.value
 
 			if _, err := app.LoadConfig(nil, envOf(env)); err == nil {
-				t.Errorf("неположительное значение %q принято как %s", value, key)
+				t.Errorf("неположительное значение %q принято как %s", test.value, test.key)
 			}
 		})
 	}

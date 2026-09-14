@@ -35,6 +35,7 @@ const (
 	accrualLease          = 5 * time.Second
 	accrualRetryAfter     = 50 * time.Millisecond
 	accrualBatchSize      = 8
+	accrualConcurrency    = 4
 )
 
 // fakeAccrualSystem — подставная внешняя система расчёта.
@@ -203,6 +204,7 @@ func newAccrualEnvironment(t *testing.T, workers int) *accrualEnvironment {
 		worker := accrual.NewWorker(accrualService, slog.New(slog.DiscardHandler), accrual.WorkerConfig{
 			PollInterval:  accrualPollInterval,
 			BatchSize:     accrualBatchSize,
+			Concurrency:   accrualConcurrency,
 			LeaseDuration: accrualLease,
 		})
 
@@ -480,6 +482,7 @@ func restartWorker(t *testing.T, env *accrualEnvironment) {
 	worker := accrual.NewWorker(accrualService, slog.New(slog.DiscardHandler), accrual.WorkerConfig{
 		PollInterval:  accrualPollInterval,
 		BatchSize:     accrualBatchSize,
+		Concurrency:   accrualConcurrency,
 		LeaseDuration: accrualLease,
 	})
 
