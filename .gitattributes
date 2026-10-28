@@ -1,0 +1,3 @@
+# Нормализация окончаний строк: Go-исходники всегда LF в рабочем дереве и в репозитории.
+# Это делает вывод gofmt/golangci-lint консистентным на Windows (core.autocrlf=true).
+*.go text eol=lf
